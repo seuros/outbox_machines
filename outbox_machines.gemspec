@@ -7,7 +7,8 @@ Gem::Specification.new do |spec|
   spec.authors = ['Abdelkader Boudih']
   spec.email = ['oss@seuros.com']
   spec.summary = 'Initial bounded outbox delivery policy with a native Rust core'
-  spec.description = 'Unstable in-memory delivery metadata (pending, claimed, confirmed, dead); not a transactional outbox or retry engine.'
+  spec.description = 'Unstable in-memory delivery metadata (pending, claimed, confirmed, dead); ' \
+                     'not a transactional outbox or retry engine.'
   spec.homepage = 'https://github.com/seuros/outbox_machines'
   spec.license = 'MIT'
   spec.required_ruby_version = '>= 4.0.0'

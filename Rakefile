@@ -11,7 +11,8 @@ SUPPORTED_NATIVE_PLATFORMS = %w[
   x86_64-linux-musl
 ].freeze
 
-native_ext = RbSys::ExtensionTask.new('outbox_machines_native', Gem::Specification.load('outbox_machines.gemspec')) do |e|
+gemspec = Gem::Specification.load('outbox_machines.gemspec')
+native_ext = RbSys::ExtensionTask.new('outbox_machines_native', gemspec) do |e|
   e.lib_dir = 'lib/outbox_machines_native'
   e.tmp_dir = 'tmp/rb_sys'
   e.cross_platform = SUPPORTED_NATIVE_PLATFORMS if ENV.key?('RUBY_TARGET')
