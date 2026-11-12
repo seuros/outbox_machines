@@ -1,0 +1,29 @@
+module OutboxMachines
+  VERSION: String
+  CAPACITY: Integer
+
+  class Attempt < Data
+    attr_reader id: Integer
+    attr_reader generation: Integer
+    def self.new: (Integer id, Integer generation) -> Attempt
+                | (id: Integer, generation: Integer) -> Attempt
+  end
+
+  class Outbox
+    type refusal = :unknown | :stale | :not_terminal | :time_regression | :invalid_duration | :exhausted
+    type disposition = :dead | [:retry, Integer]
+
+    def self.new: (Integer max_attempts) -> Outbox
+    def capacity: () -> Integer
+    def max_attempts: () -> Integer
+    def size: () -> Integer
+    def count: (:pending | :claimed | :confirmed | :dead state) -> Integer
+    def state: (Integer id) -> (:pending | :claimed | :confirmed | :dead | nil)
+    def enqueue: (Integer id, Integer now_ms) -> (:enqueued | :duplicate | :full | refusal)
+    def claim: (Integer now_ms, Integer lease_ms) -> (Attempt | nil | refusal)
+    def confirm: (Integer id, Integer generation) -> (:confirmed | refusal)
+    def fail: (Integer id, Integer generation, Integer now_ms, Integer retry_after_ms) -> (disposition | refusal)
+    def expire_claims: (Integer now_ms, Integer max_scan) -> ([Array[[Integer, Integer, disposition]], bool] | refusal)
+    def forget: (Integer id) -> (:forgotten | refusal)
+  end
+end
