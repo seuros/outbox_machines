@@ -2,28 +2,132 @@ module OutboxMachines
   VERSION: String
   CAPACITY: Integer
 
-  class Attempt < Data
+  type state = :pending | :claimed | :confirmed | :dead
+
+  # The core's `Disposition`: Retry(at), or :dead.
+  type disposition = Retry | :dead
+
+  # The core's `Disposition::Retry(at)`: pending again, claimable at or after
+  # the instant `at`, in nanoseconds.
+  class Retry < Data
+    attr_reader at: Integer
+    def self.new: (Integer at) -> Retry
+                | (at: Integer) -> Retry
+  end
+
+  # The core's `Failure::Failed(disposition)`: the live attempt is over.
+  class Failed < Data
+    attr_reader disposition: disposition
+    def self.new: (disposition disposition) -> Failed
+                | (disposition: disposition) -> Failed
+  end
+
+  # The core's `Failure::AlreadyFailed(disposition)`: an idempotent repeat,
+  # same attempt and same retry_after, carrying the standing disposition;
+  # nothing changed.
+  class AlreadyFailed < Data
+    attr_reader disposition: disposition
+    def self.new: (disposition disposition) -> AlreadyFailed
+                | (disposition: disposition) -> AlreadyFailed
+  end
+
+  # Mirrors the core's `Entry`.
+  class Entry < Data
     attr_reader id: Integer
-    attr_reader generation: Integer
-    def self.new: (Integer id, Integer generation) -> Attempt
-                | (id: Integer, generation: Integer) -> Attempt
+    attr_reader state: state
+    # Claims issued to this record so far; it dies at max_attempts.
+    attr_reader attempts: Integer
+    # Identity of the latest attempt, nil until the record is first claimed.
+    attr_reader attempt: Integer?
+    # Earliest instant, in nanoseconds, a pending record may be claimed.
+    attr_reader available_at: Integer
+    def self.new: (Integer id, state state, Integer attempts, Integer? attempt, Integer available_at) -> Entry
+                | (id: Integer, state: state, attempts: Integer, attempt: Integer?, available_at: Integer) -> Entry
+  end
+
+  # Mirrors the core's `Claimed`.
+  class Claimed < Data
+    attr_reader id: Integer
+    # Identity of the attempt: issued once per outbox, starting at 1, never
+    # reissued. Not the record's attempt count.
+    attr_reader attempt: Integer
+    # Instant, in nanoseconds, from which expire_claims may reap the lease.
+    attr_reader lease_expires: Integer
+    def self.new: (Integer id, Integer attempt, Integer lease_expires) -> Claimed
+                | (id: Integer, attempt: Integer, lease_expires: Integer) -> Claimed
+  end
+
+  # Mirrors the core's `Expired`.
+  class Expired < Data
+    attr_reader id: Integer
+    attr_reader attempt: Integer
+    attr_reader disposition: disposition
+    def self.new: (Integer id, Integer attempt, disposition disposition) -> Expired
+                | (id: Integer, attempt: Integer, disposition: disposition) -> Expired
+  end
+
+  # Mirrors the core's `Sweep`. `expired` holds the reaped claims themselves,
+  # where the core reports how many it wrote to the caller's buffer.
+  class Sweep < Data
+    attr_reader expired: Array[Expired]
+    attr_reader scanned: Integer
+    attr_reader complete: bool
+    def self.new: (Array[Expired] expired, Integer scanned, bool complete) -> Sweep
+                | (expired: Array[Expired], scanned: Integer, complete: bool) -> Sweep
   end
 
   class Outbox
-    type refusal = :unknown | :stale | :not_terminal | :time_regression | :invalid_duration | :exhausted
-    type disposition = :dead | [:retry, Integer]
+    # Every refusal symbol, one per core `Refusal` variant, no catch-all. A
+    # refused call changed nothing. Each method below lists exactly the ones
+    # it can answer.
+    type refusal = :unknown | :stale | :not_terminal | :time_regression | :invalid_duration | :exhausted | :full
+                 | :mismatch
+
+    # Every instant (`now`, `lease_expires`, a retry `at`) and every span
+    # (`lease`, `retry_after`) is Integer nanoseconds of the caller's monotonic
+    # clock. A non-Integer raises TypeError; negative or past 2**64-1 raises
+    # RangeError.
 
     def self.new: (Integer max_attempts) -> Outbox
     def capacity: () -> Integer
     def max_attempts: () -> Integer
     def size: () -> Integer
-    def count: (:pending | :claimed | :confirmed | :dead state) -> Integer
-    def state: (Integer id) -> (:pending | :claimed | :confirmed | :dead | nil)
-    def enqueue: (Integer id, Integer now_ms) -> (:enqueued | :duplicate | :full | refusal)
-    def claim: (Integer now_ms, Integer lease_ms) -> (Attempt | nil | refusal)
-    def confirm: (Integer id, Integer generation) -> (:confirmed | refusal)
-    def fail: (Integer id, Integer generation, Integer now_ms, Integer retry_after_ms) -> (disposition | refusal)
-    def expire_claims: (Integer now_ms, Integer max_scan) -> ([Array[[Integer, Integer, disposition]], bool] | refusal)
-    def forget: (Integer id) -> (:forgotten | refusal)
+    def empty?: () -> bool
+    def count: (state state) -> Integer
+    # The record with this id, or nil. Never refuses.
+    def get: (Integer id) -> Entry?
+
+    # Honoured: :enqueued, or :duplicate for an id that is already present.
+    def enqueue: (Integer id, Integer now) -> (:enqueued | :duplicate | :time_regression | :full | :exhausted)
+
+    # Honoured: a Claimed, or nil when nothing is due. :exhausted means a
+    # record is due but the outbox has issued 2**64-2 attempts; it cannot be
+    # reached in practice.
+    def claim: (Integer now, Integer lease) -> (Claimed | nil | :time_regression | :invalid_duration | :exhausted)
+
+    # Honoured: :confirmed, or :already_confirmed when this same attempt
+    # already confirmed the record (a repeat that changes nothing). :unknown
+    # is an id the outbox does not hold, forgotten records included; :stale is
+    # an attempt that is neither the live one nor the confirming one, which
+    # includes an attempt of an earlier record that carried the same id.
+    def confirm: (Integer id, Integer attempt) -> (:confirmed | :already_confirmed | :unknown | :stale)
+
+    # Honoured: a Failed, or an AlreadyFailed when `fail` already ended this
+    # same attempt with this same retry_after and no claim followed (a repeat
+    # that changes nothing and answers the standing disposition; `now` may
+    # differ). The disposition is a Retry carrying the instant the record is
+    # claimable again, or :dead once max_attempts claims are spent. :stale
+    # covers a superseded, confirmed or reaped attempt and one of an earlier
+    # record that carried the same id; :mismatch is a repeat whose retry_after
+    # is not the one recorded.
+    def fail: (Integer id, Integer attempt, Integer now, Integer retry_after)
+            -> (Failed | AlreadyFailed | :unknown | :stale | :time_regression | :invalid_duration | :mismatch)
+
+    # Honoured: a Sweep of at most 16 Expired values, also when it reaped none.
+    def expire_claims: (Integer now, Integer max_scan) -> (Sweep | :time_regression)
+
+    # Honoured: :forgotten, or :not_held for an id the outbox does not hold (a
+    # repeat that changes nothing). Never answers :unknown.
+    def forget: (Integer id) -> (:forgotten | :not_held | :not_terminal)
   end
 end

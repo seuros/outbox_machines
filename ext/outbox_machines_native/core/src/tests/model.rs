@@ -2,26 +2,158 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
+struct Row {
+    id: u64,
+    state: State,
+    /// Claims this record has had.
+    attempts: u32,
+    /// Identity of the latest claim; 0 before the first.
+    attempt: u64,
+    avail: u64,
+    lease: u64,
+    /// Enqueue sequence: also names the life of the id.
+    seq: u64,
+    /// `retry_after` of the `fail` that ended the latest attempt.
+    failed: Option<u64>,
+}
+
 /// Independent reference: a plain vector with the same documented policy.
 #[derive(Clone)]
 struct Model {
-    rows: Vec<(u64, State, u32, u64, u64, u64)>, // id, state, attempts, avail, lease, seq
+    rows: Vec<Row>,
     cap: usize,
     max: u32,
     seq: u64,
+    next_attempt: u64,
+    observed: u64,
 }
 
 impl Model {
-    fn settle(&mut self, i: usize, avail: u64) {
+    fn settle(&mut self, i: usize, avail: u64) -> Disposition {
         let max = self.max;
         let row = &mut self.rows[i];
-        if row.2 >= max {
-            row.1 = State::Dead;
+        if row.attempts >= max {
+            row.state = State::Dead;
+            Disposition::Dead
         } else {
-            row.1 = State::Pending;
-            row.3 = avail;
+            row.state = State::Pending;
+            row.avail = avail;
+            Disposition::Retry(at(avail))
         }
     }
+
+    fn enqueue(&mut self, id: u64, now: u64) -> Result<Enqueue, Refusal> {
+        if now < self.observed {
+            Err(Refusal::TimeRegression)
+        } else if self.rows.iter().any(|r| r.id == id) {
+            Ok(Enqueue::Duplicate)
+        } else if self.rows.len() >= self.cap {
+            Err(Refusal::Full)
+        } else {
+            self.rows.push(Row {
+                id,
+                state: State::Pending,
+                attempts: 0,
+                attempt: 0,
+                avail: now,
+                lease: 0,
+                seq: self.seq,
+                failed: None,
+            });
+            self.seq += 1;
+            self.observed = now;
+            Ok(Enqueue::Enqueued)
+        }
+    }
+
+    /// The claimed id and attempt identity, with the life it was issued in.
+    fn claim(&mut self, now: u64, lease: u64) -> Option<Issued> {
+        self.observed = now;
+        let attempt = self.next_attempt;
+        let row = self
+            .rows
+            .iter_mut()
+            .filter(|r| r.state == State::Pending && r.avail <= now)
+            .min_by_key(|r| r.seq)?;
+        row.state = State::Claimed;
+        row.attempts += 1;
+        row.attempt = attempt;
+        row.lease = now + lease;
+        row.failed = None;
+        self.next_attempt += 1;
+        Some(Issued {
+            id: row.id,
+            attempt,
+            life: row.seq,
+        })
+    }
+
+    fn confirm(&mut self, id: u64, attempt: u64) -> Result<Confirmation, Refusal> {
+        let row = self.rows.iter_mut().find(|r| r.id == id);
+        let row = row.ok_or(Refusal::Unknown)?;
+        match row.state {
+            _ if row.attempt != attempt => Err(Refusal::Stale),
+            State::Claimed => {
+                row.state = State::Confirmed;
+                Ok(Confirmation::Confirmed)
+            }
+            State::Confirmed => Ok(Confirmation::AlreadyConfirmed),
+            State::Pending | State::Dead => Err(Refusal::Stale),
+        }
+    }
+
+    fn fail(&mut self, id: u64, attempt: u64, now: u64, retry: u64) -> Result<Failure, Refusal> {
+        let i = self.rows.iter().position(|r| r.id == id);
+        let i = i.ok_or(Refusal::Unknown)?;
+        let row = self.rows[i];
+        if row.attempt != attempt || row.state == State::Confirmed {
+            return Err(Refusal::Stale);
+        }
+        if row.state != State::Claimed && row.failed.is_none() {
+            return Err(Refusal::Stale);
+        }
+        if now < self.observed {
+            return Err(Refusal::TimeRegression);
+        }
+        match row.failed {
+            // Ended by an earlier `fail`: the standing answer, same payload.
+            Some(recorded) if recorded != retry => Err(Refusal::Mismatch),
+            Some(_) if row.state == State::Dead => Ok(Failure::AlreadyFailed(Disposition::Dead)),
+            Some(_) => Ok(Failure::AlreadyFailed(Disposition::Retry(at(row.avail)))),
+            None => {
+                self.observed = now;
+                self.rows[i].failed = Some(retry);
+                Ok(Failure::Failed(self.settle(i, now + retry)))
+            }
+        }
+    }
+
+    fn forget(&mut self, id: u64) -> Result<Forgetting, Refusal> {
+        match self.rows.iter().position(|r| r.id == id) {
+            None => Ok(Forgetting::NotHeld),
+            Some(i) if matches!(self.rows[i].state, State::Confirmed | State::Dead) => {
+                self.rows.remove(i);
+                Ok(Forgetting::Forgotten)
+            }
+            Some(_) => Err(Refusal::NotTerminal),
+        }
+    }
+
+    /// `true` when the id is held by a record other than the one `life` names:
+    /// it was forgotten and enqueued again since the attempt was issued.
+    fn outlived(&self, issued: Issued) -> bool {
+        let row = self.rows.iter().find(|r| r.id == issued.id);
+        row.is_some_and(|r| r.seq != issued.life)
+    }
+}
+
+/// An attempt the outbox issued, and the life of the id it was issued in.
+#[derive(Clone, Copy)]
+struct Issued {
+    id: u64,
+    attempt: u64,
+    life: u64,
 }
 
 struct Rng(u64);
@@ -36,135 +168,201 @@ impl Rng {
     }
 }
 
+/// What the run must have exercised, counted across every seed.
+#[derive(Debug, Default)]
+struct Seen {
+    already_confirmed: usize,
+    already_failed: usize,
+    not_held: usize,
+    duplicate: usize,
+    mismatch: usize,
+    /// Late confirms and fails naming an attempt of an earlier life of an id
+    /// that is held again; the second counts those aimed at a live claim.
+    old_life: usize,
+    old_life_on_claimed: usize,
+}
+
 #[test]
-#[allow(clippy::too_many_lines)]
 fn behaves_like_the_reference_model() {
+    let mut tally = Seen::default();
     for seed in 0..64 {
-        let mut rng = Rng(seed);
-        let mut outbox = Outbox::<5>::new(max(3));
-        let mut model = Model {
-            rows: Vec::new(),
-            cap: 5,
-            max: 3,
-            seq: 0,
+        run(seed, &mut tally);
+    }
+    let counts = [
+        tally.already_confirmed,
+        tally.already_failed,
+        tally.not_held,
+        tally.duplicate,
+        tally.mismatch,
+        tally.old_life,
+        tally.old_life_on_claimed,
+    ];
+    assert!(counts.iter().all(|&n| n > 20), "tally: {tally:?}");
+}
+
+fn run(seed: u64, tally: &mut Seen) {
+    let mut rng = Rng(seed);
+    let mut outbox = Outbox::<5>::new(max(3));
+    let mut model = Model {
+        rows: Vec::new(),
+        cap: 5,
+        max: 3,
+        seq: 0,
+        next_attempt: 1,
+        observed: 0,
+    };
+    let mut clock = 0u64;
+    // Every attempt ever issued: late reports are drawn from here, so they
+    // outlive the forgetting and re-enqueueing of their id.
+    let mut issued: Vec<Issued> = Vec::new();
+    for _ in 0..400 {
+        clock += rng.next(4);
+        // One call in four is handed a possibly stale instant.
+        let now = if rng.next(4) == 0 {
+            clock.saturating_sub(rng.next(6))
+        } else {
+            clock
         };
-        let mut now = 0u64;
-        for _ in 0..300 {
-            now += rng.next(4);
-            let id = rng.next(8);
-            match rng.next(6) {
-                0 => {
-                    let got = outbox.enqueue(id, at(now));
-                    let want = if model.rows.iter().any(|r| r.0 == id) {
-                        Enqueue::Duplicate
-                    } else if model.rows.len() >= model.cap {
-                        Enqueue::Full
-                    } else {
-                        model.rows.push((id, State::Pending, 0, now, 0, model.seq));
-                        model.seq += 1;
-                        Enqueue::Enqueued
-                    };
-                    assert_eq!(got, Ok(want));
-                }
-                1 => {
-                    let lease = 1 + rng.next(6);
-                    let want = model
-                        .rows
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, r)| r.1 == State::Pending && r.3 <= now)
-                        .min_by_key(|(_, r)| r.5)
-                        .map(|(i, _)| i);
-                    let got = outbox.claim(at(now), at(lease));
-                    let want = want.map(|i| {
-                        let row = &mut model.rows[i];
-                        row.1 = State::Claimed;
-                        row.2 += 1;
-                        row.4 = now + lease;
-                        (row.0, row.2)
-                    });
-                    assert_eq!(got.map(|c| c.map(|c| (c.id, c.generation))), Ok(want));
-                }
-                2 | 3 => {
-                    let generation = u32::try_from(1 + rng.next(4)).unwrap_or(1);
-                    let confirm = rng.next(2) == 0;
-                    let retry = rng.next(5);
-                    let pos = model.rows.iter().position(|r| r.0 == id);
-                    let live = pos.filter(|&i| {
-                        model.rows[i].1 == State::Claimed && model.rows[i].2 == generation
-                    });
-                    let got = if confirm {
-                        outbox.confirm(id, generation).map(|()| None)
-                    } else {
-                        outbox.fail(id, generation, at(now), at(retry)).map(Some)
-                    };
-                    let want = match (pos, live) {
-                        (None, _) => Err(Refusal::Unknown),
-                        (Some(_), None) => Err(Refusal::Stale),
-                        (Some(_), Some(i)) if confirm => {
-                            model.rows[i].1 = State::Confirmed;
-                            Ok(None)
-                        }
-                        (Some(_), Some(i)) => {
-                            model.settle(i, now + retry);
-                            Ok(Some(if model.rows[i].1 == State::Dead {
-                                Disposition::Dead
-                            } else {
-                                Disposition::Retry(at(now + retry))
-                            }))
-                        }
-                    };
-                    assert_eq!(got, want, "seed {seed}");
-                }
-                4 => {
-                    let mut out = [Expired {
-                        id: 0,
-                        generation: 0,
-                        disposition: Disposition::Dead,
-                    }; 5];
-                    // Budget of N slots from any cursor position may be partial;
-                    // loop to a full pass and compare the reaped set.
-                    let mut reaped = Vec::new();
-                    loop {
-                        let sweep = outbox.expire_claims(at(now), 2, &mut out);
-                        let Ok(sweep) = sweep else {
-                            panic!("time is monotonic")
-                        };
-                        reaped.extend(out[..sweep.written].iter().map(|e| e.id));
-                        if sweep.complete {
-                            break;
-                        }
-                    }
-                    reaped.sort_unstable();
-                    let mut want = Vec::new();
-                    for i in 0..model.rows.len() {
-                        if model.rows[i].1 == State::Claimed && model.rows[i].4 <= now {
-                            want.push(model.rows[i].0);
-                            model.settle(i, now);
-                        }
-                    }
-                    want.sort_unstable();
-                    assert_eq!(reaped, want, "seed {seed}");
-                }
-                _ => {
-                    let got = outbox.forget(id);
-                    let pos = model.rows.iter().position(|r| r.0 == id);
-                    let want = match pos {
-                        None => Err(Refusal::Unknown),
-                        Some(i) if matches!(model.rows[i].1, State::Confirmed | State::Dead) => {
-                            model.rows.remove(i);
-                            Ok(())
-                        }
-                        Some(_) => Err(Refusal::NotTerminal),
-                    };
-                    assert_eq!(got, want);
+        let id = rng.next(8);
+        let before = outbox.clone();
+        let changed = match rng.next(6) {
+            0 => {
+                let got = outbox.enqueue(id, at(now));
+                assert_eq!(got, model.enqueue(id, now), "seed {seed}");
+                tally.duplicate += usize::from(got == Ok(Enqueue::Duplicate));
+                got == Ok(Enqueue::Enqueued)
+            }
+            1 => {
+                let lease = 1 + rng.next(6);
+                let got = outbox.claim(at(now), at(lease));
+                let got = got.map(|c| c.map(|c| (c.id, c.attempt)));
+                if now < model.observed {
+                    assert_eq!(got, Err(Refusal::TimeRegression), "seed {seed}");
+                    false
+                } else {
+                    // Honoured even when nothing is due: the instant counts.
+                    let want = model.claim(now, lease);
+                    assert_eq!(got, Ok(want.map(|c| (c.id, c.attempt))), "seed {seed}");
+                    issued.extend(want);
+                    true
                 }
             }
-            assert_eq!(outbox.len(), model.rows.len());
-            for row in &model.rows {
-                let entry = outbox.get(row.0).map(|e| (e.state, e.attempts));
-                assert_eq!(entry, Some((row.1, row.2)), "seed {seed}");
+            2 | 3 => report(&mut rng, &mut outbox, &mut model, &issued, (id, now), tally),
+            4 if now < model.observed => {
+                let got = outbox.expire_claims(at(now), 2, &mut []);
+                assert_eq!(got, Err(Refusal::TimeRegression), "seed {seed}");
+                false
             }
+            4 => {
+                sweep(&mut outbox, &mut model, now);
+                true
+            }
+            _ => {
+                let got = outbox.forget(id);
+                assert_eq!(got, model.forget(id), "seed {seed}");
+                tally.not_held += usize::from(got == Ok(Forgetting::NotHeld));
+                got == Ok(Forgetting::Forgotten)
+            }
+        };
+        // A refusal or an idempotent repeat leaves the whole value alone,
+        // observed clock and sweep cursor included.
+        if !changed {
+            assert_eq!(outbox, before, "seed {seed}");
+        }
+        assert_eq!(outbox.observed, at(model.observed), "seed {seed}");
+        assert_eq!(outbox.len(), model.rows.len());
+        for row in &model.rows {
+            let entry = outbox.get(row.id).map(|e| (e.state, e.attempts, e.attempt));
+            let attempt = (row.attempt != 0).then_some(row.attempt);
+            assert_eq!(
+                entry,
+                Some((row.state, row.attempts, attempt)),
+                "seed {seed}"
+            );
         }
     }
+}
+
+/// One `confirm` or `fail`; `true` when it changed the outbox.
+fn report(
+    rng: &mut Rng,
+    outbox: &mut Outbox<5>,
+    model: &mut Model,
+    issued: &[Issued],
+    (id, now): (u64, u64),
+    tally: &mut Seen,
+) -> bool {
+    let confirm = rng.next(3) == 0;
+    // Few distinct delays, so a repeated `fail` both matches and mismatches.
+    let retry = rng.next(3);
+    // Half the reports name the latest claim, so that repeats of one attempt
+    // are common; a quarter replay any attempt ever issued, however old; the
+    // rest are guesses.
+    let guess = Issued {
+        id,
+        attempt: rng.next(model.next_attempt + 2),
+        life: u64::MAX,
+    };
+    let named = match (rng.next(4), issued.last()) {
+        (0 | 1, Some(latest)) => *latest,
+        (2, Some(_)) => {
+            let pick = rng.next(issued.len() as u64);
+            issued[usize::try_from(pick).unwrap_or(0)]
+        }
+        (0..=2, None) | (3.., _) => guess,
+    };
+    let old_life = named.life != u64::MAX && model.outlived(named);
+    let on_claimed = model
+        .rows
+        .iter()
+        .any(|r| r.id == named.id && r.state == State::Claimed);
+    if old_life {
+        tally.old_life += 1;
+        tally.old_life_on_claimed += usize::from(on_claimed);
+    }
+    let Issued { id, attempt, .. } = named;
+    if confirm {
+        let got = outbox.confirm(id, attempt);
+        assert_eq!(got, model.confirm(id, attempt));
+        // An attempt of an earlier life never settles the record held now.
+        assert!(!old_life || got == Err(Refusal::Stale));
+        tally.already_confirmed += usize::from(got == Ok(Confirmation::AlreadyConfirmed));
+        got == Ok(Confirmation::Confirmed)
+    } else {
+        let got = outbox.fail(id, attempt, at(now), at(retry));
+        assert_eq!(got, model.fail(id, attempt, now, retry));
+        assert!(!old_life || got == Err(Refusal::Stale));
+        tally.already_failed += usize::from(matches!(got, Ok(Failure::AlreadyFailed(_))));
+        tally.mismatch += usize::from(got == Err(Refusal::Mismatch));
+        matches!(got, Ok(Failure::Failed(_)))
+    }
+}
+
+/// Sweep to a full pass and compare the reaped set with the model's.
+fn sweep(outbox: &mut Outbox<5>, model: &mut Model, now: u64) {
+    let mut out = [Expired::default(); 5];
+    model.observed = now;
+    // A budget of two slots is partial from any cursor position.
+    let mut reaped = Vec::new();
+    loop {
+        let sweep = outbox.expire_claims(at(now), 2, &mut out);
+        let Ok(sweep) = sweep else {
+            panic!("time is monotonic")
+        };
+        reaped.extend(out[..sweep.written].iter().map(|e| (e.id, e.attempt)));
+        if sweep.complete {
+            break;
+        }
+    }
+    reaped.sort_unstable();
+    let mut want = Vec::new();
+    for i in 0..model.rows.len() {
+        let row = model.rows[i];
+        if row.state == State::Claimed && row.lease <= now {
+            want.push((row.id, row.attempt));
+            model.settle(i, now);
+        }
+    }
+    want.sort_unstable();
+    assert_eq!(reaped, want);
 }

@@ -3,10 +3,10 @@ mod init;
 
 use std::{cell::RefCell, time::Duration};
 
-use magnus::{
-    Error, Integer, RArray, Ruby, Symbol, TryConvert, Value, prelude::*, typed_data::Obj,
+use magnus::{Error, Integer, Ruby, Symbol, TryConvert, Value, prelude::*, typed_data::Obj};
+use outbox_machines::{
+    Confirmation, Disposition, Enqueue, Expired, Failure, Forgetting, Refusal, State,
 };
-use outbox_machines::{Disposition, Enqueue, Expired, Refusal, State};
 
 const CAPACITY: usize = 64;
 const SWEEP_BUFFER: usize = 16;
@@ -27,9 +27,15 @@ impl TryConvert for Number {
 }
 
 impl Number {
-    const fn ms(self) -> Duration {
-        Duration::from_millis(self.0)
+    /// Instants and spans cross the boundary as Integer nanoseconds.
+    const fn nanos(self) -> Duration {
+        Duration::from_nanos(self.0)
     }
+}
+
+/// An instant as Integer nanoseconds. Exact: `now + span` may pass `u64`.
+fn instant(ruby: &Ruby, at: Duration) -> Integer {
+    ruby.integer_from_u128(at.as_nanos())
 }
 
 #[magnus::wrap(class = "OutboxMachines::Outbox", free_immediately, size)]
@@ -44,9 +50,15 @@ fn refusal(ruby: &Ruby, refusal: Refusal) -> Value {
         Refusal::NotTerminal => "not_terminal",
         Refusal::TimeRegression => "time_regression",
         Refusal::InvalidDuration => "invalid_duration",
-        _ => "exhausted",
+        Refusal::Full => "full",
+        Refusal::Exhausted => "exhausted",
+        Refusal::Mismatch => "mismatch",
     };
     ruby.to_symbol(name).as_value()
+}
+
+fn data(ruby: &Ruby, name: &str) -> Result<Value, Error> {
+    ruby.define_module("OutboxMachines")?.const_get(name)
 }
 
 fn state_symbol(ruby: &Ruby, state: State) -> Symbol {
@@ -54,20 +66,14 @@ fn state_symbol(ruby: &Ruby, state: State) -> Symbol {
         State::Pending => "pending",
         State::Claimed => "claimed",
         State::Confirmed => "confirmed",
-        _ => "dead",
+        State::Dead => "dead",
     })
 }
 
 fn disposition(ruby: &Ruby, value: Disposition) -> Result<Value, Error> {
     Ok(match value {
-        Disposition::Retry(at) => {
-            let at = u64::try_from(at.as_millis()).unwrap_or(u64::MAX);
-            let pair = ruby.ary_new_capa(2);
-            pair.push(ruby.to_symbol("retry"))?;
-            pair.push(at)?;
-            pair.as_value()
-        }
-        _ => ruby.to_symbol("dead").as_value(),
+        Disposition::Retry(at) => data(ruby, "Retry")?.funcall("new", (instant(ruby, at),))?,
+        Disposition::Dead => ruby.to_symbol("dead").as_value(),
     })
 }
 
@@ -100,43 +106,39 @@ impl Outbox {
         self.core.borrow().len()
     }
 
+    fn is_empty(&self) -> bool {
+        self.core.borrow().is_empty()
+    }
+
     fn enqueue(ruby: &Ruby, this: Obj<Self>, id: Number, now: Number) -> Result<Value, Error> {
         this.check_frozen()?;
-        let outcome = this.core.borrow_mut().enqueue(id.0, now.ms());
+        let outcome = this.core.borrow_mut().enqueue(id.0, now.nanos());
         Ok(match outcome {
             Ok(Enqueue::Enqueued) => ruby.to_symbol("enqueued").as_value(),
             Ok(Enqueue::Duplicate) => ruby.to_symbol("duplicate").as_value(),
-            Ok(_) => ruby.to_symbol("full").as_value(),
             Err(e) => refusal(ruby, e),
         })
     }
 
-    /// `[id, generation]`, `nil` when nothing is due, or a refusal symbol.
+    /// A `Claimed`, `nil` when nothing is due, or a refusal symbol.
     fn claim(ruby: &Ruby, this: Obj<Self>, now: Number, lease: Number) -> Result<Value, Error> {
         this.check_frozen()?;
-        let outcome = this.core.borrow_mut().claim(now.ms(), lease.ms());
+        let outcome = this.core.borrow_mut().claim(now.nanos(), lease.nanos());
         match outcome {
             Ok(Some(claimed)) => {
-                let attempt: Value = ruby.define_module("OutboxMachines")?.const_get("Attempt")?;
-                attempt.funcall("new", (claimed.id, claimed.generation))
+                let expires = instant(ruby, claimed.lease_expires);
+                data(ruby, "Claimed")?.funcall("new", (claimed.id, claimed.attempt, expires))
             }
             Ok(None) => Ok(ruby.qnil().as_value()),
             Err(e) => Ok(refusal(ruby, e)),
         }
     }
 
-    fn confirm(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        id: Number,
-        generation: Number,
-    ) -> Result<Value, Error> {
+    fn confirm(ruby: &Ruby, this: Obj<Self>, id: Number, attempt: Number) -> Result<Value, Error> {
         this.check_frozen()?;
-        let Ok(generation) = u32::try_from(generation.0) else {
-            return Ok(refusal(ruby, Refusal::Stale));
-        };
-        Ok(match this.core.borrow_mut().confirm(id.0, generation) {
-            Ok(()) => ruby.to_symbol("confirmed").as_value(),
+        Ok(match this.core.borrow_mut().confirm(id.0, attempt.0) {
+            Ok(Confirmation::Confirmed) => ruby.to_symbol("confirmed").as_value(),
+            Ok(Confirmation::AlreadyConfirmed) => ruby.to_symbol("already_confirmed").as_value(),
             Err(e) => refusal(ruby, e),
         })
     }
@@ -145,26 +147,24 @@ impl Outbox {
         ruby: &Ruby,
         this: Obj<Self>,
         id: Number,
-        generation: Number,
+        attempt: Number,
         now: Number,
         retry_after: Number,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let Ok(generation) = u32::try_from(generation.0) else {
-            return Ok(refusal(ruby, Refusal::Stale));
+        let outcome =
+            this.core
+                .borrow_mut()
+                .fail(id.0, attempt.0, now.nanos(), retry_after.nanos());
+        let (name, value) = match outcome {
+            Ok(Failure::Failed(value)) => ("Failed", value),
+            Ok(Failure::AlreadyFailed(value)) => ("AlreadyFailed", value),
+            Err(e) => return Ok(refusal(ruby, e)),
         };
-        let outcome = this
-            .core
-            .borrow_mut()
-            .fail(id.0, generation, now.ms(), retry_after.ms());
-        match outcome {
-            Ok(value) => disposition(ruby, value),
-            Err(e) => Ok(refusal(ruby, e)),
-        }
+        data(ruby, name)?.funcall("new", (disposition(ruby, value)?,))
     }
 
-    /// Up to `limit` (max 16) expirations as `[id, generation, disposition]`
-    /// rows plus whether a full pass completed: `[rows, complete]`.
+    /// A `Sweep` holding up to 16 `Expired` values, or a refusal symbol.
     fn expire_claims(
         ruby: &Ruby,
         this: Obj<Self>,
@@ -177,38 +177,40 @@ impl Outbox {
         let sweep = this
             .core
             .borrow_mut()
-            .expire_claims(now.ms(), scan, &mut out);
+            .expire_claims(now.nanos(), scan, &mut out);
         let sweep = match sweep {
             Ok(sweep) => sweep,
             Err(e) => return Ok(refusal(ruby, e)),
         };
-        let rows = ruby.ary_new_capa(sweep.written);
+        let class = data(ruby, "Expired")?;
+        let expired = ruby.ary_new_capa(sweep.written);
         for entry in out.iter().take(sweep.written) {
-            let row = ruby.ary_new_capa(3);
-            row.push(entry.id)?;
-            row.push(entry.generation)?;
-            row.push(disposition(ruby, entry.disposition)?)?;
-            rows.push(row)?;
+            let fate = disposition(ruby, entry.disposition)?;
+            let row: Value = class.funcall("new", (entry.id, entry.attempt, fate))?;
+            expired.push(row)?;
         }
-        let result: RArray = ruby.ary_new_capa(2);
-        result.push(rows)?;
-        result.push(sweep.complete)?;
-        Ok(result.as_value())
+        expired.freeze();
+        data(ruby, "Sweep")?.funcall("new", (expired, sweep.scanned, sweep.complete))
     }
 
     fn forget(ruby: &Ruby, this: Obj<Self>, id: Number) -> Result<Value, Error> {
         this.check_frozen()?;
         Ok(match this.core.borrow_mut().forget(id.0) {
-            Ok(()) => ruby.to_symbol("forgotten").as_value(),
+            Ok(Forgetting::Forgotten) => ruby.to_symbol("forgotten").as_value(),
+            Ok(Forgetting::NotHeld) => ruby.to_symbol("not_held").as_value(),
             Err(e) => refusal(ruby, e),
         })
     }
 
-    fn state(ruby: &Ruby, this: Obj<Self>, id: Number) -> Value {
-        this.core.borrow().get(id.0).map_or_else(
-            || ruby.qnil().as_value(),
-            |entry| state_symbol(ruby, entry.state).as_value(),
-        )
+    /// An `Entry`, or `nil` when no record carries the id.
+    fn get(ruby: &Ruby, this: Obj<Self>, id: Number) -> Result<Value, Error> {
+        let Some(entry) = this.core.borrow().get(id.0) else {
+            return Ok(ruby.qnil().as_value());
+        };
+        let state = state_symbol(ruby, entry.state);
+        let available_at = instant(ruby, entry.available_at);
+        let fields = (entry.id, state, entry.attempts, entry.attempt, available_at);
+        data(ruby, "Entry")?.funcall("new", fields)
     }
 
     fn count(ruby: &Ruby, this: Obj<Self>, state: Symbol) -> Result<usize, Error> {

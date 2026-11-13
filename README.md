@@ -2,7 +2,7 @@
 
 > Sent, probably, is not a delivery status.
 
-A delivery ledger for Ruby. Every message you owe the outside world gets a record: pending, claimed by one attempt, confirmed, or dead. Each claim carries a generation, so a worker that woke up late can't confirm or fail an attempt that has since been handed to someone else. Attempts that never report back are surfaced as what they are: unknown.
+A delivery ledger for Ruby. Every message you owe the outside world gets a record: pending, claimed by one attempt, confirmed, or dead. Each claim carries an attempt number the outbox issues once and never again, so a worker that woke up late can't confirm or fail an attempt that has since been handed to someone else. Attempts that never report back are surfaced as what they are: unknown.
 
 This is an initial release and the API is unstable. It is delivery policy, not a transactional outbox and not a retry engine: it does not write to your database, relay anything, sleep, or schedule.
 
@@ -13,23 +13,28 @@ gem 'outbox_machines'
 ```
 
 ```ruby
+SECOND = 1_000_000_000
+def now = Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)
+
 outbox = OutboxMachines::Outbox.new(5)   # five attempts, then dead
 
 # Once your transaction has committed the row:
-outbox.enqueue(event.id, clock.now_ms)
+outbox.enqueue(event.id, now)
 
-def relay(outbox, clock, broker)
-  attempt = outbox.claim(clock.now_ms, 30_000)
-  return unless attempt.is_a?(OutboxMachines::Attempt) # nil: nothing due
+def relay(outbox, broker)
+  claimed = outbox.claim(now, 30 * SECOND)
+  return unless claimed.is_a?(OutboxMachines::Claimed) # nil: nothing due
 
-  broker.publish(payload_for(attempt.id))
-  outbox.confirm(attempt.id, attempt.generation)
+  broker.publish(payload_for(claimed.id))
+  outbox.confirm(claimed.id, claimed.attempt)
 rescue BrokerRefused
-  outbox.fail(attempt.id, attempt.generation, clock.now_ms, 5_000)
+  outbox.fail(claimed.id, claimed.attempt, now, 5 * SECOND)
 end
 ```
 
-One outbox, six verbs. Ids and times are Integers. Times are milliseconds from a clock that only goes forward.
+One outbox, six verbs. Ids and times are Integers. Every time, instant or span, in or out, is nanoseconds from a monotonic clock: `now`, `lease`, `retry_after`, a claim's `lease_expires`, the instant in a `Retry`.
+
+The examples below use small numbers so the arithmetic fits on a line. They are nanoseconds like any other.
 
 ## A Message to the Resistance
 
@@ -66,8 +71,8 @@ Each record the outbox holds is in one of these states:
 ```mermaid
 stateDiagram-v2
     [*] --> pending: enqueue
-    pending --> claimed: claim, returns an Attempt
-    claimed --> confirmed: confirm(id, generation)
+    pending --> claimed: claim, returns a Claimed
+    claimed --> confirmed: confirm(id, attempt)
     claimed --> pending: fail, attempts remain
     claimed --> pending: expire_claims, attempts remain
     claimed --> dead: fail or expire_claims, attempts spent
@@ -84,15 +89,15 @@ sequenceDiagram
     participant R2 as Relay 2
 
     R1->>O: claim
-    O-->>R1: Attempt 42, generation 1
+    O-->>R1: Claimed 42, attempt 1
     Note over R1: publishes, then stalls
 
     R2->>O: expire_claims
-    O-->>R2: 42, generation 1, retry
+    O-->>R2: Expired 42, attempt 1, retry
     Note over R2: outcome unknown. Reconcile first.
 
     R2->>O: claim
-    O-->>R2: Attempt 42, generation 2
+    O-->>R2: Claimed 42, attempt 2
 
     R1->>O: confirm(42, 1)
     O-->>R1: :stale
@@ -110,41 +115,60 @@ outbox = OutboxMachines::Outbox.new(3)   # max attempts
 
 outbox.enqueue(42, 0)   # => :enqueued
 outbox.enqueue(42, 0)   # => :duplicate
-outbox.state(42)        # => :pending
+outbox.get(42)          # => #<data OutboxMachines::Entry id=42, state=:pending, attempts=0, attempt=nil, available_at=0>
+outbox.get(7)           # => nil, no such record
 ```
 
+`get(id)` answers the core's `Entry`: the record's `id`, its `state` (`:pending`, `:claimed`, `:confirmed` or `:dead`), the `attempts` claimed so far (what `max_attempts` counts), the `attempt` number of the latest one (`nil` until the first claim) and `available_at`, the earliest instant a pending record may be claimed. It answers `nil` for an id the outbox does not hold, and never refuses.
+
 A record is an id and nothing else. The payload stays in your table. An id is taken for as long as its record exists, in any state.
+
+`:duplicate` is not a refusal. You asked for the id to be on the board and it is, so the call is honoured and changes nothing, the outbox's clock included.
 
 ### Claim
 
 ```ruby
-attempt = outbox.claim(0, 30_000)   # now 0 ms, lease 30 s
-attempt                             # => #<data OutboxMachines::Attempt id=42, generation=1>
+claimed = outbox.claim(0, 30_000)   # now 0, lease 30_000 ns
+claimed   # => #<data OutboxMachines::Claimed id=42, attempt=1, lease_expires=30000>
 outbox.claim(0, 30_000)             # => nil, nothing else is due
-outbox.state(42)                    # => :claimed
+outbox.get(42).state                # => :claimed
 ```
 
-`claim` hands out the due pending record that was enqueued first. The generation is the count of claims this record has had, starting at 1. The lease is a deadline for `expire_claims`, not a timer: nothing happens when it passes until you ask.
+`claim(now, lease)` hands out the due pending record that was enqueued first. `nil` means nothing is due, which is an answer and not a refusal. `attempt` is the identity of this attempt: the outbox numbers every claim it hands out from one sequence, starting at 1, and never uses a number twice. It is not the count of claims this record has had; that is `get(id).attempts`. `lease_expires` is `now + lease`, the instant from which `expire_claims` may reap the attempt. It is a deadline, not a timer: nothing happens when it passes until you ask.
 
 ### Fail
 
 ```ruby
-outbox.fail(42, attempt.generation, 10, 5_000)   # => [:retry, 5010]
+failed = outbox.fail(42, claimed.attempt, 10, 5_000)
+failed               # => #<data OutboxMachines::Failed disposition=#<data OutboxMachines::Retry at=5010>>
+failed.disposition   # => #<data OutboxMachines::Retry at=5010>
+
+# The reply got lost, so the relay reports the same attempt again:
+outbox.fail(42, claimed.attempt, 12, 5_000)
+# => #<data OutboxMachines::AlreadyFailed disposition=#<data OutboxMachines::Retry at=5010>>
+outbox.fail(42, claimed.attempt, 12, 9_000)   # => :mismatch, that is not what was reported
+
 outbox.claim(5_009, 30_000)                      # => nil, not due yet
-retry_attempt = outbox.claim(5_010, 30_000)
-retry_attempt.generation                         # => 2
+second = outbox.claim(5_010, 30_000)
+second.attempt                                   # => 2
+outbox.fail(42, claimed.attempt, 5_010, 0)       # => :stale, attempt 1 was superseded
 ```
 
-`fail` is for an attempt you know did nothing. You pass the delay. The outbox does not compute backoff. Once the attempts are spent the answer changes:
+`fail(id, attempt, now, retry_after)` is for an attempt you know did nothing. You pass the delay, and the answer is a `Failed` wrapping the core's `Disposition`: a `Retry(at)` carrying the instant the record is claimable again, `now + retry_after`, or the symbol `:dead`. The outbox does not compute backoff.
+
+Report the same attempt twice and the second answer is an `AlreadyFailed`. It is not a refusal: the attempt is over, as you asked, so the call is honoured and changes nothing, the clock included. Its disposition is the one from the first call. A repeat is the same report made again: same attempt, same `retry_after`. `now` is when you called, so it may differ, but a different `retry_after` is a different report and the answer is the refusal `:mismatch`, even for a record that died. The arguments of a repeat are still checked. The outbox honours that repeat only while it can prove it: until the record is claimed again, and only when it was `fail` that ended the attempt. An attempt reaped by `expire_claims` was never failed, so a `fail` for it is `:stale`.
+
+Once the attempts are spent the answer changes:
 
 ```ruby
 single = OutboxMachines::Outbox.new(1)
 single.enqueue(1, 0)
 only = single.claim(0, 10)
 
-single.fail(1, only.generation, 5, 1_000)   # => :dead
-single.state(1)                             # => :dead
-single.claim(10_000, 10)                    # => nil
+single.fail(1, only.attempt, 5, 1_000)   # => #<data OutboxMachines::Failed disposition=:dead>
+single.fail(1, only.attempt, 6, 1_000)   # => #<data OutboxMachines::AlreadyFailed disposition=:dead>
+single.get(1).state                      # => :dead
+single.claim(10_000, 10)                 # => nil
 ```
 
 A dead record is never claimed again. It sits there, countable with `count(:dead)`, until you `forget` it.
@@ -152,13 +176,16 @@ A dead record is never claimed again. It sits there, countable with `count(:dead
 ### Confirm
 
 ```ruby
-outbox.confirm(42, 1)   # => :stale, generation 1 was superseded
+outbox.confirm(42, 1)   # => :stale, attempt 1 was superseded
 outbox.confirm(42, 2)   # => :confirmed
-outbox.confirm(42, 2)   # => :stale, it isn't claimed any more
+outbox.confirm(42, 2)   # => :already_confirmed, and nothing changed
+outbox.confirm(42, 1)   # => :stale, still not the attempt that confirmed
 outbox.confirm(7, 1)    # => :unknown
 ```
 
 `confirm` is your word that the effect is persisted on the other side. The outbox can't check. Call it after the broker's acknowledgement or your durable write, never before.
+
+`:already_confirmed` is not a refusal. A confirmed record is never claimed again, so its latest attempt is the one that confirmed it, and the outbox can tell that attempt's repeat from anyone else's for as long as it holds the record. After `forget` the record and the proof are both gone, and the same call answers `:unknown`.
 
 ### Expire claims
 
@@ -167,17 +194,22 @@ outbox = OutboxMachines::Outbox.new(2)
 outbox.enqueue(1, 0)
 lost = outbox.claim(0, 10)
 
-outbox.expire_claims(9, 64)    # => [[], true]
-outbox.expire_claims(10, 64)   # => [[[1, 1, [:retry, 10]]], true]
-outbox.state(1)                # => :pending
+sweep = outbox.expire_claims(9, 64)
+sweep.expired                  # => []
+sweep.scanned                  # => 64
+sweep.complete                 # => true
+
+sweep = outbox.expire_claims(10, 64)
+sweep.expired                  # => [#<data OutboxMachines::Expired id=1, attempt=1, disposition=#<data OutboxMachines::Retry at=10>>]
+outbox.get(1).state            # => :pending
 
 fresh = outbox.claim(10, 10)
-fresh.generation               # => 2
-outbox.confirm(1, lost.generation)    # => :stale
-outbox.confirm(1, fresh.generation)   # => :confirmed
+fresh.attempt                  # => 2
+outbox.confirm(1, lost.attempt)    # => :stale
+outbox.confirm(1, fresh.attempt)   # => :confirmed
 ```
 
-`expire_claims(now_ms, max_scan)` reaps claims whose lease has ended and returns `[rows, complete]`. Each row is `[id, generation, disposition]`, and the disposition is `[:retry, at_ms]` or `:dead`. One call looks at no more than `max_scan` records and returns no more than 16 rows. Keep calling until `complete` is true.
+`expire_claims(now, max_scan)` reaps claims whose lease has ended and answers a `Sweep`: `expired`, `scanned` and `complete`. Each entry of `expired` is an `Expired` with an `id`, an `attempt` and a `disposition`, which is a `Retry(at)` or `:dead`. An expired record is due again immediately, so `at` is the `now` you passed. One call looks at no more than `max_scan` slots, says how many it looked at in `scanned`, and reaps no more than 16 claims. Keep calling until `complete` is true.
 
 An expired attempt did not fail. Nobody knows what it did. Until it is reaped, a late `confirm` for it is still accepted, because if the effect happened the record must not go out again.
 
@@ -186,16 +218,32 @@ An expired attempt did not fail. Nobody knows what it did. Until it is reaped, a
 ```ruby
 outbox.enqueue(1, 10)   # => :duplicate, confirmed records keep their id
 outbox.forget(1)        # => :forgotten
-outbox.forget(1)        # => :unknown
+outbox.forget(1)        # => :not_held
 outbox.enqueue(1, 10)   # => :enqueued
 outbox.forget(1)        # => :not_terminal
 ```
 
-Only confirmed and dead records can be forgotten. Forgetting frees the slot and the id.
+Only confirmed and dead records can be forgotten. Forgetting frees the slot and the id. `:not_held` is not a refusal: you asked for the record to be gone and it is, whether it was forgotten earlier or never enqueued.
+
+Forgetting does not free the attempt numbers the record used. Enqueue the id again and it is a new record whose first claim gets a number nobody has held:
+
+```ruby
+outbox = OutboxMachines::Outbox.new(3)
+outbox.enqueue(7, 0)
+old = outbox.claim(0, 10)             # attempt 1
+outbox.confirm(7, old.attempt)        # => :confirmed
+outbox.forget(7)                      # => :forgotten
+outbox.enqueue(7, 0)                  # => :enqueued, a new record
+fresh = outbox.claim(0, 10)
+fresh.attempt                         # => 2
+outbox.get(7).attempts                # => 1
+outbox.confirm(7, old.attempt)        # => :stale, a report about the record that is gone
+outbox.fail(7, old.attempt, 0, 0)     # => :stale
+```
 
 ### Capacity
 
-The outbox holds 64 records at a time, in any state. Past that, `enqueue` says `:full` until something is forgotten:
+The outbox holds 64 records at a time, in any state. Past that, `enqueue` refuses with `:full` until something is forgotten:
 
 ```ruby
 outbox = OutboxMachines::Outbox.new(3)
@@ -224,13 +272,36 @@ outbox.expire_claims(9, 1)    # => :time_regression
 outbox.claim(10, 0)           # => :invalid_duration
 ```
 
-A zero lease is `:invalid_duration`. Feed it a monotonic clock in milliseconds.
+A zero lease is `:invalid_duration`. Feed it `Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)`, never wall-clock time.
+
+Only a call that is honoured and takes effect moves that clock. A refusal doesn't, and neither does a repeat: a `:duplicate` enqueue or an `AlreadyFailed`. (`confirm` and `forget` take no time at all.) A `claim` that finds nothing due and an `expire_claims` that reaps nothing were both honoured, so the time they were given counts.
+
+### What each verb can answer
+
+| Verb | Honoured | Refusals |
+| --- | --- | --- |
+| `enqueue` | `:enqueued`, `:duplicate` | `:time_regression`, `:full`, `:exhausted` |
+| `claim` | a `Claimed`, `nil` | `:time_regression`, `:invalid_duration`, `:exhausted` |
+| `confirm` | `:confirmed`, `:already_confirmed` | `:unknown`, `:stale` |
+| `fail` | `Failed(disposition)`, `AlreadyFailed(disposition)` | `:unknown`, `:stale`, `:time_regression`, `:invalid_duration`, `:mismatch` |
+| `expire_claims` | a `Sweep` | `:time_regression` |
+| `forget` | `:forgotten`, `:not_held` | `:not_terminal` |
+
+A `disposition` is a `Retry(at)` or `:dead`. The queries `get`, `count`, `size`, `empty?`, `capacity` and `max_attempts` never refuse.
+
+`:duplicate`, `:already_confirmed`, `AlreadyFailed` and `:not_held` are idempotent repeats: what you asked for already holds, so the call is honoured and changes nothing.
+
+`:unknown` comes from `confirm` and `fail` only, for an id the outbox does not hold. That includes a record you have since forgotten: the outbox keeps nothing about it, so it cannot call your report a repeat. `:stale` means the id is held but the attempt is neither its live one nor the one whose outcome the call repeats; an attempt that belonged to an earlier record with the same id is exactly that. `:mismatch` comes from `fail` only: the attempt was already failed, with a different `retry_after`.
+
+`:exhausted` means the outbox has admitted 2**64 records, or handed out 2**64 claims, in its lifetime. It cannot be reached from Ruby in practice; you will not see it. Each refusal is the snake_case of one core `Refusal` variant; there is no catch-all symbol.
 
 ## The Rules of the Courier
 
-- **Ids and times are Integers** in `0..2**64-1`. Times are milliseconds. Floats, nil, and strings raise `TypeError`. Out of range raises `RangeError`, and so does a `max_attempts` outside `1..2**32-1`.
-- **An Attempt is an id and a generation.** It is a plain frozen `Data` value. `confirm` and `fail` take the two numbers, and a generation that isn't the live one is `:stale`.
-- **Refusals don't raise.** `:duplicate`, `:full`, `:stale`, `:unknown`, `:not_terminal`, `:time_regression`, `:invalid_duration`, `:exhausted`, and `nil` are answers. Only malformed input raises. A refused call leaves every record as it was.
+- **Ids and times are Integers** in `0..2**64-1`. Floats, nil, and strings raise `TypeError`. Negative or past `2**64-1` raises `RangeError`, and so does a `max_attempts` outside `1..2**32-1`.
+- **Time is Integer nanoseconds**, for instants and spans alike. No floats, no milliseconds, no `Time`. An instant the outbox answers is exact, so `now + lease` can exceed `2**64-1` when you feed it numbers that large.
+- **A Claimed is an id, an attempt, and `lease_expires`.** `Claimed`, `Expired`, `Sweep` and `Entry` are plain frozen `Data` values with the fields of the core structs they are named after; `Retry` is the core's `Disposition::Retry(at)`, and `Failed` and `AlreadyFailed` are the two variants of its `Failure`. `Sweep#expired` holds the reaped claims themselves where the core's `Sweep::written` counts the entries it wrote to the caller's buffer. `confirm` and `fail` take the first two numbers of a `Claimed`, and an attempt that is neither the live one nor the one being repeated is `:stale`. Attempt numbers are never reissued, so a `Claimed` from last week cannot speak for a record enqueued today.
+- **Refusals don't raise.** `:full`, `:stale`, `:unknown`, `:not_terminal`, `:time_regression`, `:invalid_duration`, `:exhausted` and `:mismatch` are answers. Only malformed input raises. A refused call changes nothing: no record, and not the clock.
+- **Repeats are honoured.** `:duplicate`, `:already_confirmed`, `AlreadyFailed` and `:not_held` say the effect you asked for already holds. They change nothing either.
 - **Lookup is a scan.** The table is small on purpose. Shard across outboxes before you ask for a bigger one.
 - **Frozen means frozen.** `freeze` the outbox and `enqueue`, `claim`, `confirm`, `fail`, `expire_claims`, and `forget` all raise `FrozenError`. Reads still work.
 - **Native is required.** There is no pure-Ruby fallback.
