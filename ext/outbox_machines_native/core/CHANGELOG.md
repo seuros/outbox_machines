@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0](https://github.com/seuros/outbox_machines/compare/outbox-machines-v0.4.0...outbox-machines-v0.5.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* handles are issued through periscope-machines. Every instance can be built with a scope; a handle from another scope is refused before any lookup; all handle kinds of an instance share one sequence; resumed restores the sequence after a restart. An attempt from another outbox, or one this outbox never issued, answers Stale.
+
+### Features
+
+* scope attempt identities through periscope-machines, refuse attempts never issued, add Outbox::resumed ([f47285b](https://github.com/seuros/outbox_machines/commit/f47285b5304cbc21d6378b7f448badca23f32196))
+
 ## [0.4.0](https://github.com/seuros/outbox_machines/compare/outbox-machines-v0.3.0...outbox-machines-v0.4.0) (2026-11-13)
 
 
