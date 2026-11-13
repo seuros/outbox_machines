@@ -99,8 +99,8 @@ fn behaves_like_the_reference_model() {
                         outbox.fail(id, generation, at(now), at(retry)).map(Some)
                     };
                     let want = match (pos, live) {
-                        (None, _) => Err(Error::Unknown),
-                        (Some(_), None) => Err(Error::Stale),
+                        (None, _) => Err(Refusal::Unknown),
+                        (Some(_), None) => Err(Refusal::Stale),
                         (Some(_), Some(i)) if confirm => {
                             model.rows[i].1 = State::Confirmed;
                             Ok(None)
@@ -150,12 +150,12 @@ fn behaves_like_the_reference_model() {
                     let got = outbox.forget(id);
                     let pos = model.rows.iter().position(|r| r.0 == id);
                     let want = match pos {
-                        None => Err(Error::Unknown),
+                        None => Err(Refusal::Unknown),
                         Some(i) if matches!(model.rows[i].1, State::Confirmed | State::Dead) => {
                             model.rows.remove(i);
                             Ok(())
                         }
-                        Some(_) => Err(Error::NotTerminal),
+                        Some(_) => Err(Refusal::NotTerminal),
                     };
                     assert_eq!(got, want);
                 }

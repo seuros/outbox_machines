@@ -21,7 +21,7 @@ pub enum State {
 /// Refusal reasons. A refusal never mutates the outbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Error {
+pub enum Refusal {
     /// No record carries this id.
     Unknown,
     /// The record is not claimed, or the generation belongs to another attempt.
@@ -35,6 +35,10 @@ pub enum Error {
     /// The enqueue sequence space is exhausted.
     Exhausted,
 }
+
+/// The former name of [`Refusal`].
+#[deprecated(note = "renamed to `Refusal`")]
+pub type Error = Refusal;
 
 /// Result of [`Outbox::enqueue`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +79,10 @@ pub enum Disposition {
 /// An expired attempt is an *unknown* outcome: the worker may still be running
 /// or may have produced the external effect. Reconcile before assuming a retry
 /// is safe.
+///
+/// `Expired::default()` is a placeholder for pre-filling the output buffer:
+/// its generation is 0, and generations are 1-based, so the outbox never
+/// emits it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Expired {
     /// Record id.
@@ -83,6 +91,16 @@ pub struct Expired {
     pub generation: u32,
     /// What became of the record.
     pub disposition: Disposition,
+}
+
+impl Default for Expired {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            generation: 0,
+            disposition: Disposition::Dead,
+        }
+    }
 }
 
 /// Progress of one bounded [`Outbox::expire_claims`] call.
@@ -206,17 +224,17 @@ impl<const N: usize> Outbox<N> {
             .position(|slot| slot.as_ref().is_some_and(|record| record.id == id))
     }
 
-    fn observe(&mut self, now: Duration) -> Result<(), Error> {
+    fn observe(&mut self, now: Duration) -> Result<(), Refusal> {
         if now < self.observed {
-            return Err(Error::TimeRegression);
+            return Err(Refusal::TimeRegression);
         }
         self.observed = now;
         Ok(())
     }
 
-    fn check_time(&self, now: Duration) -> Result<(), Error> {
+    fn check_time(&self, now: Duration) -> Result<(), Refusal> {
         if now < self.observed {
-            Err(Error::TimeRegression)
+            Err(Refusal::TimeRegression)
         } else {
             Ok(())
         }
@@ -225,9 +243,9 @@ impl<const N: usize> Outbox<N> {
     /// Admit a new pending record, claimable immediately.
     ///
     /// # Errors
-    /// [`Error::TimeRegression`] for backwards time, [`Error::Exhausted`] when
+    /// [`Refusal::TimeRegression`] for backwards time, [`Refusal::Exhausted`] when
     /// the enqueue sequence is spent.
-    pub fn enqueue(&mut self, id: u64, now: Duration) -> Result<Enqueue, Error> {
+    pub fn enqueue(&mut self, id: u64, now: Duration) -> Result<Enqueue, Refusal> {
         self.check_time(now)?;
         if self.find(id).is_some() {
             self.observe(now)?;
@@ -238,7 +256,7 @@ impl<const N: usize> Outbox<N> {
             return Ok(Enqueue::Full);
         };
         let seq = self.next_seq;
-        let next = seq.checked_add(1).ok_or(Error::Exhausted)?;
+        let next = seq.checked_add(1).ok_or(Refusal::Exhausted)?;
         self.observe(now)?;
         self.next_seq = next;
         self.slots[slot] = Some(Record {
@@ -258,13 +276,13 @@ impl<const N: usize> Outbox<N> {
     /// [`Outbox::expire_claims`]; it is not enforced against late confirms.
     ///
     /// # Errors
-    /// [`Error::TimeRegression`], or [`Error::InvalidDuration`] for a zero
+    /// [`Refusal::TimeRegression`], or [`Refusal::InvalidDuration`] for a zero
     /// lease or a lease end that overflows.
-    pub fn claim(&mut self, now: Duration, lease: Duration) -> Result<Option<Claimed>, Error> {
+    pub fn claim(&mut self, now: Duration, lease: Duration) -> Result<Option<Claimed>, Refusal> {
         self.check_time(now)?;
-        let lease_expires = now.checked_add(lease).ok_or(Error::InvalidDuration)?;
+        let lease_expires = now.checked_add(lease).ok_or(Refusal::InvalidDuration)?;
         if lease.is_zero() {
-            return Err(Error::InvalidDuration);
+            return Err(Refusal::InvalidDuration);
         }
         self.observe(now)?;
         let pick = self
@@ -288,13 +306,13 @@ impl<const N: usize> Outbox<N> {
         }))
     }
 
-    fn claimed_slot(&self, id: u64, generation: u32) -> Result<usize, Error> {
-        let slot = self.find(id).ok_or(Error::Unknown)?;
+    fn claimed_slot(&self, id: u64, generation: u32) -> Result<usize, Refusal> {
+        let slot = self.find(id).ok_or(Refusal::Unknown)?;
         match &self.slots[slot] {
             Some(record) if record.state == State::Claimed && record.attempts == generation => {
                 Ok(slot)
             }
-            _ => Err(Error::Stale),
+            _ => Err(Refusal::Stale),
         }
     }
 
@@ -304,9 +322,9 @@ impl<const N: usize> Outbox<N> {
     /// superseded it: the effect happened, so the record must not be retried.
     ///
     /// # Errors
-    /// [`Error::Unknown`], or [`Error::Stale`] when the record is not claimed
+    /// [`Refusal::Unknown`], or [`Refusal::Stale`] when the record is not claimed
     /// or `generation` is not the live attempt.
-    pub fn confirm(&mut self, id: u64, generation: u32) -> Result<(), Error> {
+    pub fn confirm(&mut self, id: u64, generation: u32) -> Result<(), Refusal> {
         let slot = self.claimed_slot(id, generation)?;
         if let Some(record) = self.slots[slot].as_mut() {
             record.state = State::Confirmed;
@@ -318,22 +336,24 @@ impl<const N: usize> Outbox<N> {
     /// die once `max_attempts` claims are spent.
     ///
     /// # Errors
-    /// [`Error::Unknown`], [`Error::Stale`], [`Error::TimeRegression`], or
-    /// [`Error::InvalidDuration`] when `now + retry_after` overflows.
+    /// [`Refusal::Unknown`], [`Refusal::Stale`], [`Refusal::TimeRegression`], or
+    /// [`Refusal::InvalidDuration`] when `now + retry_after` overflows.
     pub fn fail(
         &mut self,
         id: u64,
         generation: u32,
         now: Duration,
         retry_after: Duration,
-    ) -> Result<Disposition, Error> {
+    ) -> Result<Disposition, Refusal> {
         let slot = self.claimed_slot(id, generation)?;
         self.check_time(now)?;
-        let available_at = now.checked_add(retry_after).ok_or(Error::InvalidDuration)?;
+        let available_at = now
+            .checked_add(retry_after)
+            .ok_or(Refusal::InvalidDuration)?;
         self.observe(now)?;
         let max = self.max_attempts.get();
         let Some(record) = self.slots[slot].as_mut() else {
-            return Err(Error::Unknown);
+            return Err(Refusal::Unknown);
         };
         Ok(Self::settle(record, max, available_at))
     }
@@ -356,14 +376,17 @@ impl<const N: usize> Outbox<N> {
     /// stops *before* the next due claim, so nothing is lost; call again.
     /// Expired claims retry immediately (or die at `max_attempts`).
     ///
+    /// The first [`Sweep::written`] entries of `out` are written; the rest are
+    /// left untouched. Build the buffer as `[Expired::default(); K]`.
+    ///
     /// # Errors
-    /// [`Error::TimeRegression`].
+    /// [`Refusal::TimeRegression`].
     pub fn expire_claims(
         &mut self,
         now: Duration,
         max_scan: usize,
         out: &mut [Expired],
-    ) -> Result<Sweep, Error> {
+    ) -> Result<Sweep, Refusal> {
         self.observe(now)?;
         let max = self.max_attempts.get();
         let (mut written, mut scanned) = (0, 0);
@@ -404,15 +427,15 @@ impl<const N: usize> Outbox<N> {
     /// Drop a confirmed or dead record, freeing its slot and its id.
     ///
     /// # Errors
-    /// [`Error::Unknown`], or [`Error::NotTerminal`] for pending or claimed.
-    pub fn forget(&mut self, id: u64) -> Result<(), Error> {
-        let slot = self.find(id).ok_or(Error::Unknown)?;
+    /// [`Refusal::Unknown`], or [`Refusal::NotTerminal`] for pending or claimed.
+    pub fn forget(&mut self, id: u64) -> Result<(), Refusal> {
+        let slot = self.find(id).ok_or(Refusal::Unknown)?;
         match self.slots[slot].as_ref().map(|r| r.state) {
             Some(State::Confirmed | State::Dead) => {
                 self.slots[slot] = None;
                 Ok(())
             }
-            _ => Err(Error::NotTerminal),
+            _ => Err(Refusal::NotTerminal),
         }
     }
 }

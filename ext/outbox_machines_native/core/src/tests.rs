@@ -25,7 +25,7 @@ fn happy_path_confirms_exactly_once() {
     assert_eq!((claimed.id, claimed.generation), (7, 1));
     assert_eq!(claimed.lease_expires, at(10));
     assert_eq!(outbox.confirm(7, 1), Ok(()));
-    assert_eq!(outbox.confirm(7, 1), Err(Error::Stale));
+    assert_eq!(outbox.confirm(7, 1), Err(Refusal::Stale));
     assert_eq!(outbox.get(7).map(|e| e.state), Some(State::Confirmed));
     assert_eq!(outbox.claim(at(1), at(10)), Ok(None));
 }
@@ -52,11 +52,11 @@ fn enqueue_refuses_duplicates_and_overflow_without_evicting() {
 #[test]
 fn forget_only_drops_terminal_records() {
     let mut outbox = Outbox::<2>::new(max(1));
-    assert_eq!(outbox.forget(1), Err(Error::Unknown));
+    assert_eq!(outbox.forget(1), Err(Refusal::Unknown));
     assert_eq!(outbox.enqueue(1, at(0)), Ok(Enqueue::Enqueued));
-    assert_eq!(outbox.forget(1), Err(Error::NotTerminal));
+    assert_eq!(outbox.forget(1), Err(Refusal::NotTerminal));
     let c = claim(&mut outbox, 0, 5);
-    assert_eq!(outbox.forget(1), Err(Error::NotTerminal));
+    assert_eq!(outbox.forget(1), Err(Refusal::NotTerminal));
     assert_eq!(
         outbox.fail(1, c.generation, at(0), at(0)),
         Ok(Disposition::Dead)
@@ -109,12 +109,12 @@ fn stale_generations_cannot_touch_a_newer_attempt() {
     assert_eq!(sweep.map(|s| s.written), Ok(1));
     let fresh = claim(&mut outbox, 10, 10);
     assert_eq!(fresh.generation, 2);
-    assert_eq!(outbox.confirm(1, old.generation), Err(Error::Stale));
+    assert_eq!(outbox.confirm(1, old.generation), Err(Refusal::Stale));
     assert_eq!(
         outbox.fail(1, old.generation, at(10), at(0)),
-        Err(Error::Stale)
+        Err(Refusal::Stale)
     );
-    assert_eq!(outbox.confirm(2, 1), Err(Error::Unknown));
+    assert_eq!(outbox.confirm(2, 1), Err(Refusal::Unknown));
     assert_eq!(outbox.confirm(1, fresh.generation), Ok(()));
 }
 
@@ -145,7 +145,10 @@ fn late_confirm_is_accepted_until_the_lease_is_reaped() {
         }
     );
     // Once reaped the attempt is superseded, even before a new claim.
-    assert_eq!(outbox.confirm(lost.id, lost.generation), Err(Error::Stale));
+    assert_eq!(
+        outbox.confirm(lost.id, lost.generation),
+        Err(Refusal::Stale)
+    );
     assert_eq!(outbox.get(lost.id).map(|e| e.state), Some(State::Pending));
 }
 
@@ -158,43 +161,43 @@ fn refusals_leave_the_table_untouched() {
     assert_eq!(c.id, u64::MAX);
     let before = std::format!("{outbox:?}");
     let mut out = [];
-    assert_eq!(outbox.enqueue(5, at(9)), Err(Error::TimeRegression));
+    assert_eq!(outbox.enqueue(5, at(9)), Err(Refusal::TimeRegression));
     assert_eq!(outbox.enqueue(5, at(10)), Ok(Enqueue::Full));
     assert_eq!(outbox.enqueue(0, at(10)), Ok(Enqueue::Duplicate));
-    assert_eq!(outbox.claim(at(9), at(1)), Err(Error::TimeRegression));
+    assert_eq!(outbox.claim(at(9), at(1)), Err(Refusal::TimeRegression));
     assert_eq!(
         outbox.claim(at(10), Duration::ZERO),
-        Err(Error::InvalidDuration)
+        Err(Refusal::InvalidDuration)
     );
     assert_eq!(
         outbox.claim(at(10), Duration::MAX),
-        Err(Error::InvalidDuration)
+        Err(Refusal::InvalidDuration)
     );
-    assert_eq!(outbox.confirm(7, 1), Err(Error::Unknown));
-    assert_eq!(outbox.confirm(u64::MAX, 2), Err(Error::Stale));
-    assert_eq!(outbox.confirm(u64::MAX, 0), Err(Error::Stale));
-    assert_eq!(outbox.confirm(0, 0), Err(Error::Stale));
-    assert_eq!(outbox.confirm(0, 1), Err(Error::Stale));
-    assert_eq!(outbox.fail(7, 1, at(10), at(0)), Err(Error::Unknown));
+    assert_eq!(outbox.confirm(7, 1), Err(Refusal::Unknown));
+    assert_eq!(outbox.confirm(u64::MAX, 2), Err(Refusal::Stale));
+    assert_eq!(outbox.confirm(u64::MAX, 0), Err(Refusal::Stale));
+    assert_eq!(outbox.confirm(0, 0), Err(Refusal::Stale));
+    assert_eq!(outbox.confirm(0, 1), Err(Refusal::Stale));
+    assert_eq!(outbox.fail(7, 1, at(10), at(0)), Err(Refusal::Unknown));
     assert_eq!(
         outbox.fail(u64::MAX, u32::MAX, at(10), at(0)),
-        Err(Error::Stale)
+        Err(Refusal::Stale)
     );
     assert_eq!(
         outbox.fail(u64::MAX, 1, at(9), at(0)),
-        Err(Error::TimeRegression)
+        Err(Refusal::TimeRegression)
     );
     assert_eq!(
         outbox.fail(u64::MAX, 1, at(10), Duration::MAX),
-        Err(Error::InvalidDuration)
+        Err(Refusal::InvalidDuration)
     );
     assert_eq!(
         outbox.expire_claims(at(9), 2, &mut out),
-        Err(Error::TimeRegression)
+        Err(Refusal::TimeRegression)
     );
-    assert_eq!(outbox.forget(7), Err(Error::Unknown));
-    assert_eq!(outbox.forget(0), Err(Error::NotTerminal));
-    assert_eq!(outbox.forget(u64::MAX), Err(Error::NotTerminal));
+    assert_eq!(outbox.forget(7), Err(Refusal::Unknown));
+    assert_eq!(outbox.forget(0), Err(Refusal::NotTerminal));
+    assert_eq!(outbox.forget(u64::MAX), Err(Refusal::NotTerminal));
     assert_eq!(std::format!("{outbox:?}"), before);
 }
 
@@ -244,31 +247,31 @@ fn expire_claims_is_bounded_and_resumable() {
 fn time_and_duration_refusals_do_not_mutate() {
     let mut outbox = Outbox::<2>::new(max(3));
     assert_eq!(outbox.enqueue(1, at(10)), Ok(Enqueue::Enqueued));
-    assert_eq!(outbox.enqueue(2, at(9)), Err(Error::TimeRegression));
-    assert_eq!(outbox.claim(at(9), at(1)), Err(Error::TimeRegression));
+    assert_eq!(outbox.enqueue(2, at(9)), Err(Refusal::TimeRegression));
+    assert_eq!(outbox.claim(at(9), at(1)), Err(Refusal::TimeRegression));
     assert_eq!(
         outbox.claim(at(10), Duration::ZERO),
-        Err(Error::InvalidDuration)
+        Err(Refusal::InvalidDuration)
     );
     assert_eq!(
         outbox.claim(Duration::MAX, at(1)),
-        Err(Error::InvalidDuration)
+        Err(Refusal::InvalidDuration)
     );
     assert_eq!(outbox.get(1).map(|e| e.state), Some(State::Pending));
     let c = claim(&mut outbox, 10, 5);
     assert_eq!(
         outbox.fail(1, c.generation, at(9), at(0)),
-        Err(Error::TimeRegression)
+        Err(Refusal::TimeRegression)
     );
     assert_eq!(
         outbox.fail(1, c.generation, Duration::MAX, at(1)),
-        Err(Error::InvalidDuration)
+        Err(Refusal::InvalidDuration)
     );
     assert_eq!(outbox.get(1).map(|e| e.state), Some(State::Claimed));
     let mut out = [];
     assert_eq!(
         outbox.expire_claims(at(9), 1, &mut out),
-        Err(Error::TimeRegression)
+        Err(Refusal::TimeRegression)
     );
 }
 
@@ -276,8 +279,26 @@ fn time_and_duration_refusals_do_not_mutate() {
 fn sequence_exhaustion_is_refused() {
     let mut outbox = Outbox::<1>::new(max(1));
     outbox.next_seq = u64::MAX;
-    assert_eq!(outbox.enqueue(1, at(0)), Err(Error::Exhausted));
+    assert_eq!(outbox.enqueue(1, at(0)), Err(Refusal::Exhausted));
     assert!(outbox.is_empty());
 }
 
 mod model;
+
+#[test]
+fn a_default_buffer_is_filled_from_the_front() {
+    let mut outbox = Outbox::<2>::new(max(1));
+    assert_eq!(outbox.enqueue(9, at(0)), Ok(Enqueue::Enqueued));
+    let lost = claim(&mut outbox, 0, 5);
+    let mut out = [Expired::default(); 3];
+    assert_eq!(out[0].generation, 0);
+    let sweep = outbox.expire_claims(at(5), 2, &mut out);
+    assert_eq!(sweep.map(|s| s.written), Ok(1));
+    let reaped = Expired {
+        id: lost.id,
+        generation: lost.generation,
+        disposition: Disposition::Dead,
+    };
+    assert_eq!(out[0], reaped);
+    assert_eq!(out[1..], [Expired::default(); 2]);
+}

@@ -31,11 +31,14 @@ small. Ids are `u64`; payloads live outside.
   at `now + retry_after`, or `Dead` once `max_attempts` claims are spent.
 - `expire_claims(now, max_scan, out)`: reaps claims whose lease ended, into a
   caller buffer, with a persistent cursor. Bounded by `max_scan` and
-  `out.len()`; call again until `Sweep::complete`.
+  `out.len()`; call again until `Sweep::complete`. Writes the first
+  `Sweep::written` entries of `out` and leaves the rest untouched. Build the
+  buffer as `[Expired::default(); K]`: the default is a placeholder with
+  generation 0, which the outbox never emits.
 - `forget(id)`: drops a confirmed or dead record.
 
 A wrong or superseded generation, or a record that is not claimed, is
-`Error::Stale`. Refusals never mutate the table.
+`Refusal::Stale`. Refusals never mutate the table.
 
 ## Ambiguous effects
 
@@ -63,6 +66,6 @@ assert_eq!(
 );
 let retry = outbox.claim(Duration::from_secs(5), Duration::from_secs(30)).unwrap().unwrap();
 assert_eq!(retry.generation, 2);
-assert_eq!(outbox.confirm(42, 1), Err(outbox_machines::Error::Stale));
+assert_eq!(outbox.confirm(42, 1), Err(outbox_machines::Refusal::Stale));
 assert_eq!(outbox.confirm(42, 2), Ok(()));
 ```

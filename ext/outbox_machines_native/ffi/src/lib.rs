@@ -6,7 +6,7 @@ use std::{cell::RefCell, time::Duration};
 use magnus::{
     Error, Integer, RArray, Ruby, Symbol, TryConvert, Value, prelude::*, typed_data::Obj,
 };
-use outbox_machines::{Disposition, Enqueue, Error as Refusal, Expired, State};
+use outbox_machines::{Disposition, Enqueue, Expired, Refusal, State};
 
 const CAPACITY: usize = 64;
 const SWEEP_BUFFER: usize = 16;
@@ -172,12 +172,7 @@ impl Outbox {
         max_scan: Number,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let blank = Expired {
-            id: 0,
-            generation: 0,
-            disposition: Disposition::Dead,
-        };
-        let mut out = [blank; SWEEP_BUFFER];
+        let mut out = [Expired::default(); SWEEP_BUFFER];
         let scan = usize::try_from(max_scan.0).unwrap_or(usize::MAX);
         let sweep = this
             .core
