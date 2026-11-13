@@ -134,7 +134,7 @@ outbox.claim(0, 30_000)             # => nil, nothing else is due
 outbox.get(42).state                # => :claimed
 ```
 
-`claim(now, lease)` hands out the due pending record that was enqueued first. `nil` means nothing is due, which is an answer and not a refusal. `attempt` is the identity of this attempt: the outbox numbers every claim it hands out from one sequence, starting at 1, and never uses a number twice. It is not the count of claims this record has had; that is `get(id).attempts`. `lease_expires` is `now + lease`, the instant from which `expire_claims` may reap the attempt. It is a deadline, not a timer: nothing happens when it passes until you ask.
+`claim(now, lease)` hands out the due pending record that was enqueued first. `nil` means nothing is due, which is an answer and not a refusal. `attempt` is the identity of this attempt: the outbox numbers every claim it hands out from one sequence, starting at 1, and never uses a number twice. An outbox built with `Outbox.with_scope(max_attempts, scope)` stamps its scope into the top 16 bits of that number. It is not the count of claims this record has had; that is `get(id).attempts`. `lease_expires` is `now + lease`, the instant from which `expire_claims` may reap the attempt. It is a deadline, not a timer: nothing happens when it passes until you ask.
 
 ### Fail
 
@@ -282,24 +282,26 @@ Only a call that is honoured and takes effect moves that clock. A refusal doesn'
 | --- | --- | --- |
 | `enqueue` | `:enqueued`, `:duplicate` | `:time_regression`, `:full`, `:exhausted` |
 | `claim` | a `Claimed`, `nil` | `:time_regression`, `:invalid_duration`, `:exhausted` |
-| `confirm` | `:confirmed`, `:already_confirmed` | `:unknown`, `:stale` |
-| `fail` | `Failed(disposition)`, `AlreadyFailed(disposition)` | `:unknown`, `:stale`, `:time_regression`, `:invalid_duration`, `:mismatch` |
+| `confirm` | `:confirmed`, `:already_confirmed` | `:stale`, `:unknown` |
+| `fail` | `Failed(disposition)`, `AlreadyFailed(disposition)` | `:stale`, `:unknown`, `:time_regression`, `:invalid_duration`, `:mismatch` |
 | `expire_claims` | a `Sweep` | `:time_regression` |
 | `forget` | `:forgotten`, `:not_held` | `:not_terminal` |
 
-A `disposition` is a `Retry(at)` or `:dead`. The queries `get`, `count`, `size`, `empty?`, `capacity` and `max_attempts` never refuse.
+A `disposition` is a `Retry(at)` or `:dead`. The queries `get`, `count`, `size`, `empty?`, `capacity`, `max_attempts`, `scope` and `issued` never refuse.
 
 `:duplicate`, `:already_confirmed`, `AlreadyFailed` and `:not_held` are idempotent repeats: what you asked for already holds, so the call is honoured and changes nothing.
 
-`:unknown` comes from `confirm` and `fail` only, for an id the outbox does not hold. That includes a record you have since forgotten: the outbox keeps nothing about it, so it cannot call your report a repeat. `:stale` means the id is held but the attempt is neither its live one nor the one whose outcome the call repeats; an attempt that belonged to an earlier record with the same id is exactly that. `:mismatch` comes from `fail` only: the attempt was already failed, with a different `retry_after`.
+`:unknown` comes from `confirm` and `fail` only, for an id the outbox does not hold, reported with an attempt the outbox did issue. That includes a record you have since forgotten: the outbox keeps nothing about it, so it cannot call your report a repeat. `:stale` means the id is held but the attempt is neither its live one nor the one whose outcome the call repeats; an attempt that belonged to an earlier record with the same id is exactly that. An attempt this outbox never issued is `:stale` too, and that is answered first, before the id is even looked up, so it is `:stale` for an id the outbox does not hold as well: an attempt from an outbox of another scope, a number of its own scope it has not reached yet, or a number whose low 48 bits are zero. `:mismatch` comes from `fail` only: the attempt was already failed, with a different `retry_after`.
 
-`:exhausted` means the outbox has admitted 2**64 records, or handed out 2**64 claims, in its lifetime. It cannot be reached from Ruby in practice; you will not see it. Each refusal is the snake_case of one core `Refusal` variant; there is no catch-all symbol.
+`:exhausted` means the outbox has admitted 2**64 records, or handed out every attempt number of its scope (2**48 - 1 claims), in its lifetime. It cannot be reached from Ruby in practice; you will not see it. Each refusal is the snake_case of one core `Refusal` variant; there is no catch-all symbol.
 
 ## The Rules of the Courier
 
 - **Ids and times are Integers** in `0..2**64-1`. Floats, nil, and strings raise `TypeError`. Negative or past `2**64-1` raises `RangeError`, and so does a `max_attempts` outside `1..2**32-1`.
 - **Time is Integer nanoseconds**, for instants and spans alike. No floats, no milliseconds, no `Time`. An instant the outbox answers is exact, so `now + lease` can exceed `2**64-1` when you feed it numbers that large.
 - **A Claimed is an id, an attempt, and `lease_expires`.** `Claimed`, `Expired`, `Sweep` and `Entry` are plain frozen `Data` values with the fields of the core structs they are named after; `Retry` is the core's `Disposition::Retry(at)`, and `Failed` and `AlreadyFailed` are the two variants of its `Failure`. `Sweep#expired` holds the reaped claims themselves where the core's `Sweep::written` counts the entries it wrote to the caller's buffer. `confirm` and `fail` take the first two numbers of a `Claimed`, and an attempt that is neither the live one nor the one being repeated is `:stale`. Attempt numbers are never reissued, so a `Claimed` from last week cannot speak for a record enqueued today.
+- **Scopes.** An attempt number is only meaningful to the outbox that issued it. Numbers count from 1, so two outboxes that hold the same record id hand out the same ones, and a report sent to the wrong outbox would settle the wrong attempt. Give each outbox its own scope: `Outbox.with_scope(max_attempts, scope)`, any Integer in `0..65_535` (a non-Integer raises `TypeError`, anything outside the range raises `RangeError`). `Outbox.new(max_attempts)` is scope zero, and `outbox.scope` reads it back. The scope rides in the top 16 bits of every `attempt`, and `confirm` and `fail` answer `:stale` to an attempt from another scope. The outbox can't pick a scope for you, and two outboxes left in the same scope still mix up each other's attempts.
+- **Restarts.** A new outbox counts from 1 again, so an attempt that outlived a restart could name a new claim. Either save `outbox.issued` (how many attempt numbers it has handed out) and restart with `Outbox.resumed(max_attempts, scope, issued)`, which carries on at `issued + 1`, or give each incarnation a scope no earlier one used. Save the count before you act on a claim: resuming from too low a count hands numbers out twice. `issued` is an Integer in `0..2**48-1`; anything else raises `TypeError` or `RangeError`. Records are not restored, enqueue them again.
 - **Refusals don't raise.** `:full`, `:stale`, `:unknown`, `:not_terminal`, `:time_regression`, `:invalid_duration`, `:exhausted` and `:mismatch` are answers. Only malformed input raises. A refused call changes nothing: no record, and not the clock.
 - **Repeats are honoured.** `:duplicate`, `:already_confirmed`, `AlreadyFailed` and `:not_held` say the effect you asked for already holds. They change nothing either.
 - **Lookup is a scan.** The table is small on purpose. Shard across outboxes before you ask for a bigger one.

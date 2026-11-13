@@ -1,8 +1,14 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
 
+mod refusal;
+
 use core::num::NonZeroU32;
 use core::time::Duration;
+
+use periscope_machines::{Issuer, scope_of};
+
+pub use refusal::Refusal;
 
 /// Delivery state of one record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,50 +22,6 @@ pub enum State {
     /// Attempts are exhausted; the record will not be claimed again.
     Dead,
 }
-
-/// Why a call was not honoured. A refusal changes nothing: no record, no
-/// cursor, and not the observed clock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal {
-    /// No record carries this id. Answered by [`Outbox::confirm`] and
-    /// [`Outbox::fail`] only; a forgotten record is unknown again.
-    Unknown,
-    /// `attempt` is neither the record's live attempt nor the attempt whose
-    /// outcome the call repeats: it was superseded, reaped, never issued, or
-    /// issued to an earlier record that carried the same id.
-    Stale,
-    /// The record is not terminal, so it cannot be forgotten.
-    NotTerminal,
-    /// `now` is earlier than a previously observed instant.
-    TimeRegression,
-    /// A zero lease or an instant that overflows [`Duration`].
-    InvalidDuration,
-    /// The enqueue sequence or the attempt sequence is spent: the outbox can
-    /// admit no further record, or issue no further attempt.
-    Exhausted,
-    /// Every slot is occupied; nothing was evicted.
-    Full,
-    /// A repeated [`Outbox::fail`] names a `retry_after` other than the one
-    /// recorded for that attempt, so it is not the same report.
-    Mismatch,
-}
-
-impl core::fmt::Display for Refusal {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::Unknown => "no record carries this id",
-            Self::Stale => "the attempt is not the live one",
-            Self::NotTerminal => "the record is not confirmed or dead",
-            Self::TimeRegression => "now is earlier than an observed instant",
-            Self::InvalidDuration => "zero lease or overflowing instant",
-            Self::Exhausted => "the enqueue or attempt sequence is spent",
-            Self::Full => "every slot is occupied",
-            Self::Mismatch => "retry_after is not the one recorded for this attempt",
-        })
-    }
-}
-
-impl core::error::Error for Refusal {}
 
 /// Honoured outcome of [`Outbox::enqueue`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,13 +69,23 @@ pub enum Forgetting {
 pub struct Claimed {
     /// Claimed record id.
     pub id: u64,
-    /// Identity of this attempt: issued once for the lifetime of the outbox,
-    /// starting at 1, and never again, not even after the record is forgotten
-    /// and its id enqueued anew. It is not the record's attempt count; that is
-    /// [`Entry::attempts`].
+    /// Identity of this attempt: issued once for the lifetime of the outbox
+    /// and never again, not even after the record is forgotten and its id
+    /// enqueued anew. It carries the outbox's scope above a sequence that
+    /// starts at 1, so scope zero issues 1, 2, 3. It is not the record's
+    /// attempt count; that is [`Entry::attempts`].
     pub attempt: u64,
     /// Instant at which the lease may be reaped by [`Outbox::expire_claims`].
     pub lease_expires: Duration,
+}
+
+impl Claimed {
+    /// The scope of the outbox that issued this attempt, see
+    /// [`Outbox::with_scope`].
+    #[must_use]
+    pub const fn scope(&self) -> u16 {
+        scope_of(self.attempt)
+    }
 }
 
 /// Where a failed or expired attempt went.
@@ -132,7 +104,7 @@ pub enum Disposition {
 /// is safe.
 ///
 /// `Expired::default()` is a placeholder for pre-filling the output buffer:
-/// its attempt is 0, and attempt identities start at 1, so the outbox never
+/// its attempt is 0, which no outbox of any scope issues, so the outbox never
 /// emits it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Expired {
@@ -142,6 +114,14 @@ pub struct Expired {
     pub attempt: u64,
     /// What became of the record.
     pub disposition: Disposition,
+}
+
+impl Expired {
+    /// The scope of the outbox that issued the reaped attempt.
+    #[must_use]
+    pub const fn scope(&self) -> u16 {
+        scope_of(self.attempt)
+    }
 }
 
 impl Default for Expired {
@@ -237,24 +217,78 @@ pub struct Outbox<const N: usize> {
     max_attempts: NonZeroU32,
     observed: Duration,
     next_seq: u64,
-    next_attempt: u64,
+    /// Issues the attempt identities; it also holds the outbox's scope.
+    attempts: Issuer,
     cursor: usize,
     scanned_in_pass: usize,
 }
 
 impl<const N: usize> Outbox<N> {
-    /// Empty table; a record dies after `max_attempts` claims fail or expire.
+    /// Empty table in scope zero; a record dies after `max_attempts` claims
+    /// fail or expire.
     #[must_use]
     pub const fn new(max_attempts: NonZeroU32) -> Self {
+        Self::with_scope(max_attempts, 0)
+    }
+
+    /// Empty table whose attempt identities carry `scope`.
+    ///
+    /// An attempt identity is a plain integer, so two outboxes in the same
+    /// scope issue the same ones, and a report sent to the wrong outbox can
+    /// settle a live attempt there when both hold the record id. Give every
+    /// outbox whose reports could meet its own scope: an attempt of another
+    /// scope is then always [`Refusal::Stale`]. The outbox cannot pick a
+    /// scope itself; keeping them distinct is the caller's job.
+    #[must_use]
+    pub const fn with_scope(max_attempts: NonZeroU32, scope: u16) -> Self {
         Self {
             slots: [None; N],
             max_attempts,
             observed: Duration::ZERO,
             next_seq: 0,
-            next_attempt: 1,
+            attempts: Issuer::new(scope),
             cursor: 0,
             scanned_in_pass: 0,
         }
+    }
+
+    /// Empty table that continues the attempt sequence of `scope` after
+    /// `issued` identities: the restart of an outbox that saved
+    /// [`Outbox::issued`].
+    ///
+    /// The next claim carries sequence `issued + 1`, so an attempt that
+    /// outlived the restart is never issued again and cannot settle a new
+    /// claim. `resumed(max_attempts, scope, 0)` is [`Outbox::with_scope`].
+    /// Records are not restored: enqueue them again.
+    ///
+    /// Resuming from a count lower than what was really issued reissues
+    /// identities, so save [`Outbox::issued`] before acting on a claim. An
+    /// outbox that cannot save it takes a scope no earlier incarnation used
+    /// instead.
+    ///
+    /// `None` when `issued` is beyond `SEQUENCE_MAX` (2^48 - 1), which no
+    /// outbox reaches.
+    #[must_use]
+    pub const fn resumed(max_attempts: NonZeroU32, scope: u16, issued: u64) -> Option<Self> {
+        let Some(attempts) = Issuer::resumed(scope, issued) else {
+            return None;
+        };
+        let mut outbox = Self::with_scope(max_attempts, scope);
+        outbox.attempts = attempts;
+        Some(outbox)
+    }
+
+    /// The scope carried by every attempt identity this outbox issues.
+    #[must_use]
+    pub const fn scope(&self) -> u16 {
+        self.attempts.scope()
+    }
+
+    /// How many attempt identities this outbox has issued; also the sequence
+    /// number of the latest one. Save it to restart with [`Outbox::resumed`].
+    #[must_use]
+    pub const fn issued(&self) -> u64 {
+        self.attempts.issued()
     }
 
     /// Compile-time record capacity.
@@ -360,7 +394,7 @@ impl<const N: usize> Outbox<N> {
     ///
     /// The claim is stamped with an attempt identity from a sequence the
     /// outbox never rewinds: forgetting a record does not free the identities
-    /// its attempts used.
+    /// its attempts used. A scope holds `SEQUENCE_MAX` (2^48 - 1) of them.
     ///
     /// # Errors
     /// [`Refusal::TimeRegression`], [`Refusal::InvalidDuration`] for a zero
@@ -384,10 +418,11 @@ impl<const N: usize> Outbox<N> {
             self.observed = now;
             return Ok(None);
         };
-        let attempt = self.next_attempt;
-        let next = attempt.checked_add(1).ok_or(Refusal::Exhausted)?;
+        let attempt = match self.attempts.issue() {
+            Ok(attempt) => attempt,
+            Err(periscope_machines::Refusal::Exhausted) => return Err(Refusal::Exhausted),
+        };
         self.observed = now;
-        self.next_attempt = next;
         record.attempts = record.attempts.saturating_add(1);
         record.attempt = attempt;
         record.state = State::Claimed;
@@ -398,6 +433,16 @@ impl<const N: usize> Outbox<N> {
             attempt,
             lease_expires,
         }))
+    }
+
+    /// An attempt this outbox never issued names nothing here: one of another
+    /// scope, one past what was issued, or sequence zero.
+    const fn check_issued(&self, attempt: u64) -> Result<(), Refusal> {
+        if self.attempts.owns(attempt) {
+            Ok(())
+        } else {
+            Err(Refusal::Stale)
+        }
     }
 
     fn record(&mut self, id: u64) -> Result<&mut Record, Refusal> {
@@ -419,11 +464,15 @@ impl<const N: usize> Outbox<N> {
     /// provable for as long as the record is held, and changes nothing.
     ///
     /// # Errors
-    /// [`Refusal::Unknown`] when no record carries the id, which includes a
-    /// confirmed record that was since forgotten. [`Refusal::Stale`] when
-    /// `attempt` is neither the live attempt nor the confirming one, which
-    /// includes an attempt of an earlier record that carried this id.
+    /// In this order: [`Refusal::Stale`] for an attempt this outbox never
+    /// issued (another scope, or a sequence it has not reached), before any
+    /// record is looked up. [`Refusal::Unknown`] when no record carries the
+    /// id, which includes a confirmed record that was since forgotten.
+    /// [`Refusal::Stale`] when `attempt` is neither the live attempt nor the
+    /// confirming one, which includes an attempt of an earlier record that
+    /// carried this id.
     pub fn confirm(&mut self, id: u64, attempt: u64) -> Result<Confirmation, Refusal> {
+        self.check_issued(attempt)?;
         let record = self.record(id)?;
         if record.attempt != attempt {
             return Err(Refusal::Stale);
@@ -453,9 +502,11 @@ impl<const N: usize> Outbox<N> {
     /// for it is [`Refusal::Stale`].
     ///
     /// # Errors
-    /// In this order: [`Refusal::Unknown`] when no record carries the id,
-    /// [`Refusal::Stale`] when `attempt` is neither the live attempt nor the
-    /// one `fail` just ended, [`Refusal::TimeRegression`],
+    /// In this order: [`Refusal::Stale`] for an attempt this outbox never
+    /// issued (another scope, or a sequence it has not reached), before any
+    /// record is looked up, [`Refusal::Unknown`] when no record carries the
+    /// id, [`Refusal::Stale`] when `attempt` is neither the live attempt nor
+    /// the one `fail` just ended, [`Refusal::TimeRegression`],
     /// [`Refusal::InvalidDuration`] when `now + retry_after` overflows, and
     /// [`Refusal::Mismatch`] for a repeat with another `retry_after`.
     pub fn fail(
@@ -465,6 +516,7 @@ impl<const N: usize> Outbox<N> {
         now: Duration,
         retry_after: Duration,
     ) -> Result<Failure, Refusal> {
+        self.check_issued(attempt)?;
         let (observed, max) = (self.observed, self.max_attempts.get());
         let record = self.record(id)?;
         if record.attempt != attempt {

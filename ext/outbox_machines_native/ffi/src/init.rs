@@ -1,5 +1,5 @@
 //! Private native entry point.
-use crate::{CAPACITY, Outbox};
+use crate::{CAPACITY, Outbox, scope_of};
 use magnus::{Error, Ruby, function, method, prelude::*};
 
 #[magnus::init]
@@ -9,6 +9,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let class = module.define_class("Outbox", ruby.class_object())?;
     class.undef_default_alloc_func();
     class.define_singleton_method("new", function!(Outbox::new, 1))?;
+    class.define_singleton_method("with_scope", function!(Outbox::with_scope, 2))?;
+    class.define_singleton_method("resumed", function!(Outbox::resumed, 3))?;
+    class.define_method("scope", method!(Outbox::scope, 0))?;
+    class.define_method("issued", method!(Outbox::issued, 0))?;
+    class.define_singleton_method("__scope_of", function!(scope_of, 1))?;
     class.define_method("capacity", method!(Outbox::capacity, 0))?;
     class.define_method("max_attempts", method!(Outbox::max_attempts, 0))?;
     class.define_method("size", method!(Outbox::size, 0))?;

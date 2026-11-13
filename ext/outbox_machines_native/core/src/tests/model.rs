@@ -1,6 +1,7 @@
 //! Randomized runs against an independent naive model.
 
 use super::*;
+use periscope_machines::{scope_of, scoped, sequence_of};
 
 #[derive(Clone, Copy)]
 struct Row {
@@ -25,6 +26,8 @@ struct Model {
     cap: usize,
     max: u32,
     seq: u64,
+    scope: u16,
+    /// Sequence number of the next attempt identity.
     next_attempt: u64,
     observed: u64,
 }
@@ -70,7 +73,7 @@ impl Model {
     /// The claimed id and attempt identity, with the life it was issued in.
     fn claim(&mut self, now: u64, lease: u64) -> Option<Issued> {
         self.observed = now;
-        let attempt = self.next_attempt;
+        let attempt = scoped(self.scope, self.next_attempt);
         let row = self
             .rows
             .iter_mut()
@@ -89,7 +92,16 @@ impl Model {
         })
     }
 
+    /// Whether this outbox handed `attempt` out: its scope, a sequence reached.
+    fn issued(&self, attempt: u64) -> bool {
+        let sequence = sequence_of(attempt);
+        scope_of(attempt) == self.scope && sequence != 0 && sequence < self.next_attempt
+    }
+
     fn confirm(&mut self, id: u64, attempt: u64) -> Result<Confirmation, Refusal> {
+        if !self.issued(attempt) {
+            return Err(Refusal::Stale);
+        }
         let row = self.rows.iter_mut().find(|r| r.id == id);
         let row = row.ok_or(Refusal::Unknown)?;
         match row.state {
@@ -104,6 +116,9 @@ impl Model {
     }
 
     fn fail(&mut self, id: u64, attempt: u64, now: u64, retry: u64) -> Result<Failure, Refusal> {
+        if !self.issued(attempt) {
+            return Err(Refusal::Stale);
+        }
         let i = self.rows.iter().position(|r| r.id == id);
         let i = i.ok_or(Refusal::Unknown)?;
         let row = self.rows[i];
@@ -180,13 +195,22 @@ struct Seen {
     /// that is held again; the second counts those aimed at a live claim.
     old_life: usize,
     old_life_on_claimed: usize,
+    /// Reports carrying an attempt of another scope whose sequence number is
+    /// the latest issued here; the second counts those aimed at a held id.
+    foreign: usize,
+    foreign_on_held: usize,
+    /// In scope but never issued, naming an id no record carries: the report
+    /// a scope comparison alone would answer `Unknown`.
+    never_issued_on_absent: usize,
 }
 
 #[test]
 fn behaves_like_the_reference_model() {
     let mut tally = Seen::default();
     for seed in 0..64 {
-        run(seed, &mut tally);
+        // Scope zero, a middle scope and the last one all behave alike.
+        let scope = [0, 0x0102, u16::MAX][usize::try_from(seed % 3).unwrap_or(0)];
+        run(seed, scope, &mut tally);
     }
     let counts = [
         tally.already_confirmed,
@@ -196,18 +220,23 @@ fn behaves_like_the_reference_model() {
         tally.mismatch,
         tally.old_life,
         tally.old_life_on_claimed,
+        tally.foreign,
+        tally.foreign_on_held,
+        tally.never_issued_on_absent,
     ];
     assert!(counts.iter().all(|&n| n > 20), "tally: {tally:?}");
 }
 
-fn run(seed: u64, tally: &mut Seen) {
+fn run(seed: u64, scope: u16, tally: &mut Seen) {
     let mut rng = Rng(seed);
-    let mut outbox = Outbox::<5>::new(max(3));
+    let mut outbox = Outbox::<5>::with_scope(max(3), scope);
+    assert_eq!(outbox.scope(), scope);
     let mut model = Model {
         rows: Vec::new(),
         cap: 5,
         max: 3,
         seq: 0,
+        scope,
         next_attempt: 1,
         observed: 0,
     };
@@ -300,7 +329,7 @@ fn report(
     // rest are guesses.
     let guess = Issued {
         id,
-        attempt: rng.next(model.next_attempt + 2),
+        attempt: scoped(model.scope, rng.next(model.next_attempt + 2)),
         life: u64::MAX,
     };
     let named = match (rng.next(4), issued.last()) {
@@ -311,6 +340,22 @@ fn report(
         }
         (0..=2, None) | (3.., _) => guess,
     };
+    // One report in eight comes from an outbox of another scope that issued
+    // the same sequence number: the same record id, a different identity.
+    let named = if rng.next(8) == 0 {
+        tally.foreign += 1;
+        // Flipping low scope bits always lands in another scope.
+        let flip = [1u16, 2, 3][usize::try_from(rng.next(3)).unwrap_or(0)];
+        tally.foreign_on_held += usize::from(model.rows.iter().any(|r| r.id == named.id));
+        Issued {
+            attempt: named.attempt ^ scoped(flip, 0),
+            life: u64::MAX,
+            ..named
+        }
+    } else {
+        named
+    };
+    let foreign = scope_of(named.attempt) != model.scope;
     let old_life = named.life != u64::MAX && model.outlived(named);
     let on_claimed = model
         .rows
@@ -321,17 +366,20 @@ fn report(
         tally.old_life_on_claimed += usize::from(on_claimed);
     }
     let Issued { id, attempt, .. } = named;
+    let never_issued = !foreign && !model.issued(attempt);
+    let absent = model.rows.iter().all(|r| r.id != id);
+    tally.never_issued_on_absent += usize::from(never_issued && absent);
     if confirm {
         let got = outbox.confirm(id, attempt);
         assert_eq!(got, model.confirm(id, attempt));
         // An attempt of an earlier life never settles the record held now.
-        assert!(!old_life || got == Err(Refusal::Stale));
+        assert!(!(old_life || foreign || never_issued) || got == Err(Refusal::Stale));
         tally.already_confirmed += usize::from(got == Ok(Confirmation::AlreadyConfirmed));
         got == Ok(Confirmation::Confirmed)
     } else {
         let got = outbox.fail(id, attempt, at(now), at(retry));
         assert_eq!(got, model.fail(id, attempt, now, retry));
-        assert!(!old_life || got == Err(Refusal::Stale));
+        assert!(!(old_life || foreign || never_issued) || got == Err(Refusal::Stale));
         tally.already_failed += usize::from(matches!(got, Ok(Failure::AlreadyFailed(_))));
         tally.mismatch += usize::from(got == Err(Refusal::Mismatch));
         matches!(got, Ok(Failure::Failed(_)))

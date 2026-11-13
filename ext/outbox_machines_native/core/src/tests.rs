@@ -289,33 +289,11 @@ fn sequence_exhaustion_is_refused() {
     assert_eq!(outbox, before);
 }
 
-#[test]
-fn attempt_exhaustion_is_refused_only_when_a_record_is_due() {
-    let mut outbox = Outbox::<2>::new(max(3));
-    assert_eq!(outbox.enqueue(1, at(0)), Ok(Enqueue::Enqueued));
-    assert_eq!(outbox.enqueue(2, at(9)), Ok(Enqueue::Enqueued));
-    outbox.next_attempt = u64::MAX - 1;
-    let last = claim(&mut outbox, 9, 5);
-    assert_eq!((last.id, last.attempt), (1, u64::MAX - 1));
-    let before = outbox.clone();
-    // The instant is not recorded either: the call changed nothing.
-    assert_eq!(outbox.claim(at(50), at(5)), Err(Refusal::Exhausted));
-    assert_eq!(outbox, before);
-    assert_eq!(outbox.get(2).map(|e| e.attempt), Some(None));
-    // The attempt already issued is still settled normally.
-    assert_eq!(outbox.confirm(1, last.attempt), Ok(Confirmation::Confirmed));
-    assert_eq!(outbox.forget(1), Ok(Forgetting::Forgotten));
-    // With nothing due there is nothing to stamp, so the answer is honoured.
-    let mut spent = Outbox::<1>::new(max(1));
-    spent.next_attempt = u64::MAX;
-    assert_eq!(spent.claim(at(3), at(5)), Ok(None));
-    assert_eq!(spent.enqueue(1, at(2)), Err(Refusal::TimeRegression));
-}
-
 mod clock;
 mod model;
 mod reissue;
 mod repeat;
+mod scope;
 
 #[test]
 fn a_default_buffer_is_filled_from_the_front() {

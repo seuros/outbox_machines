@@ -8,7 +8,12 @@ module OutboxMachines
   # which `expire_claims` may reap the lease. The outbox issues an attempt
   # identity once and never again, also after the record is forgotten and its
   # id enqueued anew; it is not the record's attempt count (`Entry#attempts`).
-  Claimed = Data.define(:id, :attempt, :lease_expires)
+  # The identity carries the scope of the outbox that issued it
+  # (`Outbox.with_scope`); an outbox of another scope answers :stale to it.
+  Claimed = Data.define(:id, :attempt, :lease_expires) do
+    # The scope of the outbox that issued this attempt.
+    def scope = Outbox.__send__(:__scope_of, attempt)
+  end
 
   # The core's `Disposition::Retry(at)`: the record is pending again and
   # claimable at or after the instant `at` (Integer nanoseconds). The other
@@ -28,7 +33,10 @@ module OutboxMachines
   # One claim reaped by `expire_claims`: the record id, the identity of the
   # attempt whose lease ran out, and what became of the record (a Retry or
   # :dead). Its outcome is unknown, not failed.
-  Expired = Data.define(:id, :attempt, :disposition)
+  Expired = Data.define(:id, :attempt, :disposition) do
+    # The scope of the outbox that issued the reaped attempt.
+    def scope = Outbox.__send__(:__scope_of, attempt)
+  end
 
   # Progress of one bounded `expire_claims` call: the Expired values it reaped,
   # the slots it examined, and whether the cursor has completed a full pass.
@@ -44,3 +52,9 @@ end
 # Native is required: no algorithm fallback. It builds the Data values above,
 # so they must exist first.
 require 'outbox_machines_native/outbox_machines_native'
+
+module OutboxMachines
+  class Outbox
+    private_class_method :__scope_of
+  end
+end

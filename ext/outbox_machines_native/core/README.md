@@ -34,19 +34,22 @@ small. Ids are `u64`; payloads live outside.
 - `claim(now, lease) -> Result<Option<Claimed>, Refusal>`: the due pending
   record enqueued first, or `None` when nothing is due. `Claimed::attempt` is
   the identity of the attempt, drawn from one sequence for the whole outbox,
-  starting at 1. Refuses with `TimeRegression`, `InvalidDuration`, or
+  starting at 1 and carried under the outbox's scope. Refuses with `TimeRegression`, `InvalidDuration`, or
   `Exhausted` when a record is due but that sequence is spent.
 - `confirm(id, attempt) -> Result<Confirmation, Refusal>`: the caller
   asserts the external effect was persisted. The outbox cannot verify it.
   Accepted even after the lease deadline, as long as no newer attempt exists.
   `Confirmed`, or `AlreadyConfirmed` when this same attempt already
-  confirmed the record. Refuses with `Unknown` or `Stale`.
+  confirmed the record. Refuses with `Stale` for an attempt this outbox never
+  issued (another scope, or a sequence it has not reached; before any
+  lookup), then `Unknown` or `Stale`.
 - `fail(id, attempt, now, retry_after) -> Result<Failure, Refusal>`: a
   *known* failure. `Failed(Disposition)`: back to pending at
   `now + retry_after`, or `Dead` once `max_attempts` claims are spent.
   `AlreadyFailed(Disposition)` when `fail` already ended this same attempt
   with this same `retry_after` and no claim followed; it carries the standing
-  disposition. Refuses, in this order, with `Unknown`, `Stale`,
+  disposition. Refuses, in this order, with `Stale` for an attempt this outbox
+  never issued, `Unknown`, `Stale`,
   `TimeRegression`, `InvalidDuration`, or `Mismatch` for a repeat whose
   `retry_after` is not the one recorded.
 - `expire_claims(now, max_scan, out)`: reaps claims whose lease ended, into a
@@ -68,9 +71,39 @@ An attempt identity is issued once for the lifetime of the outbox. It is not
 the record's attempt count, which restarts when an id is forgotten and
 enqueued again; the identity does not. A worker that claimed id 7, went quiet,
 and reports back after 7 was confirmed, forgotten, enqueued and claimed anew
-presents an identity the new record never had: `Stale`, nothing changed. The
-sequence is a `u64`; when it is spent `claim` refuses with `Exhausted` rather
-than wrap.
+presents an identity the new record never had: `Stale`, nothing changed.
+
+## Scopes
+
+An attempt identity means something only to the outbox that issued it. It is
+a `u64` in the [`periscope-machines`](https://crates.io/crates/periscope-machines)
+layout: the outbox's scope in the top 16 bits, a sequence counted from 1 in
+the low 48. `Outbox::new(max_attempts)` is scope zero and issues 1, 2, 3;
+`Outbox::with_scope(max_attempts, scope)` issues the same sequence under
+`scope`, and `Outbox::scope()`, `Claimed::scope()` and `Expired::scope()` read
+it back.
+
+Two outboxes that hold the same record id issue the same sequence numbers, so
+without scopes a report sent to the wrong outbox settles the wrong attempt.
+Give each outbox its own scope: `confirm` and `fail` then answer `Stale` to an
+attempt of another scope before they look at any record, and nothing changes.
+The outbox reads no clock and no random source, so it cannot pick a scope;
+two outboxes left in the same scope still alias.
+
+The check is `periscope_machines::Issuer::owns`, so it refuses more than
+another scope: an attempt of this scope whose sequence the outbox has not
+reached, or sequence zero, was never issued here and is `Stale` too, whatever
+the id.
+
+A fresh outbox starts its sequence again, so an attempt that outlived a
+restart could name a new claim. Either save `Outbox::issued()` and restart
+with `Outbox::resumed(max_attempts, scope, issued)`, which continues at
+`issued + 1` (`None` when `issued` is past 2^48 - 1), or give each incarnation
+a scope no earlier one used. Save the count before acting on a claim:
+resuming from too low a count reissues identities.
+
+A scope holds 2^48 - 1 identities. When they are spent `claim` refuses with
+`Exhausted` rather than wrap, and only when a record is due.
 
 ## Repeats and refusals
 
@@ -81,7 +114,10 @@ can prove from the record it still holds:
 
 - A confirmed record is never claimed again, so its latest attempt *is* the
   confirming one. `confirm` with that attempt repeats; any other attempt is
-  `Stale`, an attempt of an earlier record with the same id included.
+  `Stale`, an attempt of an earlier record with the same id included. The
+  attempt a record holds was issued by this outbox, and an attempt of another
+  scope is refused before the record is read, so a repeat is only ever
+  honoured for an identity of this scope.
 - A record remembers whether its latest attempt was ended by `fail`, and with
   which `retry_after`. `fail` with that attempt and that `retry_after` repeats
   until the record is claimed again. `now` is the instant of the call, not
@@ -95,12 +131,14 @@ can prove from the record it still holds:
   reaps nothing.
 
 `Refusal::Unknown` is answered by `confirm` and `fail` only, when no record
-carries the id. That includes a record that was confirmed or dead and then
+carries the id and the attempt is one this outbox issued. That includes a record that was confirmed or dead and then
 forgotten: nothing about it is kept, so a late repeat cannot be proven and is
 `Unknown`. `enqueue`, `claim`, `expire_claims` and `forget` never answer it.
 
 `Refusal::Stale` means the id is held but `attempt` is neither its live
-attempt nor the attempt whose outcome the call repeats. The variants are
+attempt nor the attempt whose outcome the call repeats, or that this outbox
+never issued `attempt` (another scope, or a sequence it has not reached),
+whatever the id. The variants are
 `Unknown`, `Stale`, `NotTerminal`, `TimeRegression`, `InvalidDuration`,
 `Exhausted`, `Full` and `Mismatch`. `Refusal` is the only refusal type, no public enum is `#[non_exhaustive]`
 (a new variant is a breaking change every caller matches on), and a refused call

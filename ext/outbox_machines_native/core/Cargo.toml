@@ -13,5 +13,8 @@ categories = ["no-std", "algorithms"]
 [features]
 default = []
 
+[dependencies]
+periscope-machines.workspace = true
+
 [lints]
 workspace = true

@@ -227,10 +227,11 @@ class OutboxTest < Minitest::Test
     [0, 2**32].each { |n| assert_raises(RangeError) { outbox(n) } }
     assert_raises(ArgumentError) { box.count(:nope) }
     assert_raises(TypeError) { OutboxMachines::Outbox.allocate }
-    assert_equal :unknown, box.confirm(1, 2**64 - 1)
-    assert_equal :unknown, box.fail(1, 2**64 - 1, 0, 0)
+    # An attempt the outbox never issued is refused before the id is looked up.
+    assert_equal :stale, box.confirm(1, 2**48 - 1)
+    assert_equal :stale, box.fail(1, 2**48 - 1, 0, 0)
     box.enqueue(1, 0)
-    assert_equal :stale, box.confirm(1, 2**64 - 1)
+    assert_equal :stale, box.confirm(1, 2**48 - 1)
     assert_equal :stale, box.fail(1, 2**64 - 1, 0, 0)
     assert_raises(RangeError) { box.confirm(1, 2**64) }
     assert_raises(RangeError) { box.fail(1, -1, 0, 0) }

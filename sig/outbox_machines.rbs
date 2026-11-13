@@ -48,13 +48,16 @@ module OutboxMachines
   # Mirrors the core's `Claimed`.
   class Claimed < Data
     attr_reader id: Integer
-    # Identity of the attempt: issued once per outbox, starting at 1, never
-    # reissued. Not the record's attempt count.
+    # Identity of the attempt: issued once per outbox and never reissued. It
+    # carries the outbox's scope in its top 16 bits above a sequence starting
+    # at 1, so scope zero issues 1, 2, 3. Not the record's attempt count.
     attr_reader attempt: Integer
     # Instant, in nanoseconds, from which expire_claims may reap the lease.
     attr_reader lease_expires: Integer
     def self.new: (Integer id, Integer attempt, Integer lease_expires) -> Claimed
                 | (id: Integer, attempt: Integer, lease_expires: Integer) -> Claimed
+    # The scope of the outbox that issued this attempt.
+    def scope: () -> Integer
   end
 
   # Mirrors the core's `Expired`.
@@ -64,6 +67,8 @@ module OutboxMachines
     attr_reader disposition: disposition
     def self.new: (Integer id, Integer attempt, disposition disposition) -> Expired
                 | (id: Integer, attempt: Integer, disposition: disposition) -> Expired
+    # The scope of the outbox that issued the reaped attempt.
+    def scope: () -> Integer
   end
 
   # Mirrors the core's `Sweep`. `expired` holds the reaped claims themselves,
@@ -88,7 +93,25 @@ module OutboxMachines
     # clock. A non-Integer raises TypeError; negative or past 2**64-1 raises
     # RangeError.
 
+    # An empty outbox in scope zero.
     def self.new: (Integer max_attempts) -> Outbox
+    # An empty outbox whose attempt identities carry `scope`, an Integer in
+    # 0..65_535 (TypeError for a non-Integer, RangeError outside the range).
+    # An attempt from an outbox of another scope is always :stale.
+    def self.with_scope: (Integer max_attempts, Integer scope) -> Outbox
+    # An empty outbox of `scope` that continues the attempt sequence after
+    # `issued` identities, the count a previous incarnation read from #issued:
+    # the next claim carries sequence issued + 1. `issued` is an Integer in
+    # 0..2**48-1 (TypeError for a non-Integer, RangeError outside the range;
+    # the core answers None there). resumed(max_attempts, scope, 0) is
+    # with_scope(max_attempts, scope).
+    def self.resumed: (Integer max_attempts, Integer scope, Integer issued) -> Outbox
+    def scope: () -> Integer
+    # How many attempt identities this outbox has issued; also the sequence
+    # number of the latest one. Save it to restart with Outbox.resumed.
+    def issued: () -> Integer
+    # Private: what Claimed#scope and Expired#scope read.
+    def self.__scope_of: (Integer attempt) -> Integer
     def capacity: () -> Integer
     def max_attempts: () -> Integer
     def size: () -> Integer
@@ -101,13 +124,15 @@ module OutboxMachines
     def enqueue: (Integer id, Integer now) -> (:enqueued | :duplicate | :time_regression | :full | :exhausted)
 
     # Honoured: a Claimed, or nil when nothing is due. :exhausted means a
-    # record is due but the outbox has issued 2**64-2 attempts; it cannot be
-    # reached in practice.
+    # record is due but the outbox has issued every attempt identity of its
+    # scope, 2**48-1 of them; it cannot be reached in practice.
     def claim: (Integer now, Integer lease) -> (Claimed | nil | :time_regression | :invalid_duration | :exhausted)
 
     # Honoured: :confirmed, or :already_confirmed when this same attempt
-    # already confirmed the record (a repeat that changes nothing). :unknown
-    # is an id the outbox does not hold, forgotten records included; :stale is
+    # already confirmed the record (a repeat that changes nothing). :stale
+    # for an attempt this outbox never issued (another scope, or a sequence
+    # it has not reached) comes first, whatever the id. :unknown is an id
+    # the outbox does not hold, forgotten records included; :stale is
     # an attempt that is neither the live one nor the confirming one, which
     # includes an attempt of an earlier record that carried the same id.
     def confirm: (Integer id, Integer attempt) -> (:confirmed | :already_confirmed | :unknown | :stale)
@@ -117,8 +142,10 @@ module OutboxMachines
     # that changes nothing and answers the standing disposition; `now` may
     # differ). The disposition is a Retry carrying the instant the record is
     # claimable again, or :dead once max_attempts claims are spent. :stale
-    # covers a superseded, confirmed or reaped attempt and one of an earlier
-    # record that carried the same id; :mismatch is a repeat whose retry_after
+    # covers a superseded, confirmed or reaped attempt, one of an earlier
+    # record that carried the same id, and one this outbox never issued
+    # (another scope, or a sequence it has not reached; answered first,
+    # whatever the id); :mismatch is a repeat whose retry_after
     # is not the one recorded.
     def fail: (Integer id, Integer attempt, Integer now, Integer retry_after)
             -> (Failed | AlreadyFailed | :unknown | :stale | :time_regression | :invalid_duration | :mismatch)

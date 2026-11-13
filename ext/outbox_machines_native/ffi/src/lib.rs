@@ -33,6 +33,34 @@ impl Number {
     }
 }
 
+/// A scope: an Integer in `0..=65535`.
+#[derive(Clone, Copy)]
+struct Scope(u16);
+
+impl TryConvert for Scope {
+    fn try_convert(value: Value) -> Result<Self, Error> {
+        let ruby = Ruby::get_with(value);
+        if Integer::from_value(value).is_none() {
+            return Err(Error::new(
+                ruby.exception_type_error(),
+                "scope must be an Integer",
+            ));
+        }
+        u16::try_convert(value)
+            .map(Self)
+            .map_err(|_| Error::new(ruby.exception_range_error(), "scope must be in 0..=65535"))
+    }
+}
+
+/// The scope an attempt identity carries: `Claimed#scope`, `Expired#scope`.
+fn scope_of(attempt: Number) -> u16 {
+    let expired = Expired {
+        attempt: attempt.0,
+        ..Expired::default()
+    };
+    expired.scope()
+}
+
 /// An instant as Integer nanoseconds. Exact: `now + span` may pass `u64`.
 fn instant(ruby: &Ruby, at: Duration) -> Integer {
     ruby.integer_from_u128(at.as_nanos())
@@ -80,18 +108,39 @@ fn disposition(ruby: &Ruby, value: Disposition) -> Result<Value, Error> {
 // Refusals are answers (symbols), not exceptions. Only malformed input raises.
 impl Outbox {
     fn new(ruby: &Ruby, max_attempts: Number) -> Result<Self, Error> {
+        Self::with_scope(ruby, max_attempts, Scope(0))
+    }
+
+    fn with_scope(ruby: &Ruby, max_attempts: Number, scope: Scope) -> Result<Self, Error> {
+        Self::resumed(ruby, max_attempts, scope, Number(0))
+    }
+
+    /// The core answers `None` for a count past the sequence; that is
+    /// malformed input, so it raises like every other argument out of range.
+    fn resumed(
+        ruby: &Ruby,
+        max_attempts: Number,
+        scope: Scope,
+        issued: Number,
+    ) -> Result<Self, Error> {
+        let range = |message| Error::new(ruby.exception_range_error(), message);
         let max = u32::try_from(max_attempts.0)
             .ok()
             .and_then(std::num::NonZeroU32::new)
-            .ok_or_else(|| {
-                Error::new(
-                    ruby.exception_range_error(),
-                    "max_attempts must be in 1..2**32-1",
-                )
-            })?;
+            .ok_or_else(|| range("max_attempts must be in 1..2**32-1"))?;
+        let core = outbox_machines::Outbox::resumed(max, scope.0, issued.0)
+            .ok_or_else(|| range("issued must be in 0..2**48-1"))?;
         Ok(Self {
-            core: RefCell::new(outbox_machines::Outbox::new(max)),
+            core: RefCell::new(core),
         })
+    }
+
+    fn issued(&self) -> u64 {
+        self.core.borrow().issued()
+    }
+
+    fn scope(&self) -> u16 {
+        self.core.borrow().scope()
     }
 
     fn capacity(&self) -> usize {
