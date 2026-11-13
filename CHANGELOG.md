@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0](https://github.com/seuros/outbox_machines/compare/outbox_machines/v0.1.2...outbox_machines/v0.2.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* see CONVENTIONS: one exhaustive Refusal per crate, Result from every mutator, honoured idempotent repeats, Ruby mirrors the core. No compatibility aliases. Claimed and Expired carry a u64 attempt instead of a per-record generation; refused or repeated calls never advance the clock; the Error alias is gone; Ruby times are Integer nanoseconds and values mirror the core.
+
+### Features
+
+* never reissue attempt identities, honour repeated confirm, fail and forget, Full and Mismatch refusals ([12af815](https://github.com/seuros/outbox_machines/commit/12af815e86a5ac549ec5149642afe35c91ff7a75))
+
 ## [0.1.2](https://github.com/seuros/outbox_machines/compare/outbox_machines/v0.1.1...outbox_machines/v0.1.2) (2026-11-13)
 
 
