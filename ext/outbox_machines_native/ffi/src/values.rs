@@ -1,8 +1,10 @@
 //! Private hooks behind the `Data` values: each one is valid or does not
 //! exist. A wrong type raises `TypeError`; a value the core's constructor
 //! answers `None` for raises `RangeError`.
-use magnus::{Error, Ruby, Symbol, Value, prelude::*};
-use matryona_machines::ruby::{Symbols, exact_array, exact_fields, instant, integer, optional};
+use magnus::{Error, Ruby, Value, prelude::*};
+use matryona_machines::ruby::{
+    Choice, Symbols, exact_array, exact_fields, instant, integer, optional, symbol_or_fields,
+};
 use outbox_machines::{Claimed, Disposition, Entry, Expired, Pass, State, Sweep};
 
 use crate::{classes::classes, range};
@@ -26,20 +28,26 @@ matryona_machines::symbols! {
     }
 }
 
+matryona_machines::symbols! {
+    /// The core's dispositions as Symbols: `:dead` reads back; a retry is
+    /// its `Retry`.
+    pub Dispositions for Disposition as "a disposition" => names_only {
+        Retry(..) => "retry",
+        Dead => "dead",
+    }
+}
+
 /// A `Retry` or `:dead`, read back into the core's `Disposition`. A `Retry`
 /// must be exactly a `Retry`, and its instant is read and checked again.
 fn disposition(ruby: &Ruby, value: Value) -> Result<Disposition, Error> {
-    if let Some(symbol) = Symbol::from_value(value) {
-        return if &*symbol.name()? == "dead" {
-            Ok(Disposition::Dead)
-        } else {
-            Err(range(ruby, "a disposition Symbol must be :dead"))
-        };
-    }
     let message = "disposition must be a Retry or :dead";
-    let retry = classes(ruby)?.retry.get(ruby);
-    let [at] = exact_fields::<1>(ruby, value, retry, message)?;
-    Ok(Disposition::Retry(instant(at, "at")?))
+    let retry = [classes(ruby)?.retry.get(ruby)];
+    Ok(
+        match symbol_or_fields(ruby, value, Dispositions, &retry, message)? {
+            Choice::Symbol(disposition) => disposition,
+            Choice::Struct(_, [at]) => Disposition::Retry(instant(at, "at")?),
+        },
+    )
 }
 
 /// Any instant is a valid `Disposition::Retry`; the conversion is the check.

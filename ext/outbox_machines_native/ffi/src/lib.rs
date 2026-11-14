@@ -6,7 +6,9 @@ mod values;
 use std::{cell::RefCell, num::NonZeroU32};
 
 use magnus::{Error, RClass, Ruby, Symbol, Value, prelude::*, typed_data::Obj};
-use matryona_machines::ruby::{Symbols, duration, integer, keep, nanoseconds, positive, symbol};
+use matryona_machines::ruby::{
+    SymbolNames, Symbols, duration, integer, keep, nanoseconds, positive, symbol,
+};
 
 use crate::classes::classes;
 use outbox_machines::{
@@ -70,7 +72,7 @@ fn state_symbol(ruby: &Ruby, state: State) -> Symbol {
 fn disposition(ruby: &Ruby, retry: RClass, value: Disposition) -> Result<Value, Error> {
     Ok(match value {
         Disposition::Retry(at) => retry.funcall("new", (nanoseconds(ruby, at),))?,
-        Disposition::Dead => symbol(ruby, "dead").as_value(),
+        Disposition::Dead => values::Dispositions::symbol(ruby, &value).as_value(),
     })
 }
 

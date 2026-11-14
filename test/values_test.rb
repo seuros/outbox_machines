@@ -22,7 +22,9 @@ class ValuesTest < Minitest::Test
     [Failed, AlreadyFailed].each do |failure|
       assert_equal :dead, failure.new(:dead).disposition
       assert_equal Retry.new(5), failure.new(disposition: Retry.new(5)).disposition
-      assert_raises(RangeError) { failure.new(:nope) }
+      %i[nope retry].each do |bad|
+        assert_equal 'disposition must be a Retry or :dead', assert_raises(RangeError) { failure.new(bad) }.message
+      end
       [nil, 5, 'dead', Object.new, Claimed.new(1, 1, 1)].each { |bad| assert_raises(TypeError) { failure.new(bad) } }
     end
   end
