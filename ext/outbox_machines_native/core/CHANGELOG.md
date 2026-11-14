@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/seuros/outbox_machines/compare/outbox-machines-v0.6.0...outbox-machines-v0.7.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* build the binding on matryona-machines; accept a genuine value whose singleton class was opened; name every argument in conversion errors
+
+### Features
+
+* build the binding on matryona-machines; accept a genuine value whose singleton class was opened; name every argument in conversion errors ([79e565c](https://github.com/seuros/outbox_machines/commit/79e565c2859fd02c7ca7fc99057b0cca410aa988))
+
 ## [0.6.0](https://github.com/seuros/outbox_machines/compare/outbox-machines-v0.5.0...outbox-machines-v0.6.0) (2026-11-14)
 
 
