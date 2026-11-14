@@ -6,6 +6,8 @@ use magnus::{Error, Ruby, function, method, prelude::*};
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("OutboxMachines")?;
     module.const_set("CAPACITY", CAPACITY)?;
+    crate::classes::resolve(ruby, module)?;
+    crate::values::define(module)?;
     let class = module.define_class("Outbox", ruby.class_object())?;
     class.undef_default_alloc_func();
     class.define_singleton_method("new", function!(Outbox::new, 1))?;

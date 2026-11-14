@@ -17,11 +17,11 @@ fn settled(scope: u16) -> (Outbox<3>, Claimed, Claimed) {
     let confirmed = claim(&mut outbox, 0, 10);
     let failed = claim(&mut outbox, 0, 10);
     assert_eq!(
-        outbox.confirm(7, confirmed.attempt),
+        outbox.confirm(7, confirmed.attempt()),
         Ok(Confirmation::Confirmed)
     );
     assert_eq!(
-        outbox.fail(8, failed.attempt, at(1), at(4)),
+        outbox.fail(8, failed.attempt(), at(1), at(4)),
         Ok(Failure::Failed(Disposition::Retry(at(5))))
     );
     (outbox, confirmed, failed)
@@ -36,8 +36,8 @@ fn an_attempt_from_another_outbox_settles_nothing() {
     assert_eq!(far.enqueue(9, at(1)), Ok(Enqueue::Enqueued));
     let near_live = claim(&mut near, 1, 10);
     let far_live = claim(&mut far, 1, 10);
-    assert_eq!((near_live.id, far_live.id), (9, 9));
-    assert_ne!(near_live.attempt, far_live.attempt);
+    assert_eq!((near_live.id(), far_live.id()), (9, 9));
+    assert_ne!(near_live.attempt(), far_live.attempt());
     assert_eq!((near_live.scope(), far_live.scope()), (1, 2));
 
     let foreign = [
@@ -47,27 +47,27 @@ fn an_attempt_from_another_outbox_settles_nothing() {
     for (outbox, [confirmed, failed, live]) in foreign {
         let before = outbox.clone();
         // A live claim on the same id is not settled.
-        assert_eq!(outbox.confirm(9, live.attempt), Err(Refusal::Stale));
+        assert_eq!(outbox.confirm(9, live.attempt()), Err(Refusal::Stale));
         assert_eq!(
-            outbox.fail(9, live.attempt, at(1), at(4)),
+            outbox.fail(9, live.attempt(), at(1), at(4)),
             Err(Refusal::Stale)
         );
         // Nor is a repeat honoured: the confirmed and failed attempts here
         // carry the same sequence numbers, but they are not these.
-        assert_eq!(outbox.confirm(7, confirmed.attempt), Err(Refusal::Stale));
+        assert_eq!(outbox.confirm(7, confirmed.attempt()), Err(Refusal::Stale));
         assert_eq!(
-            outbox.fail(7, confirmed.attempt, at(1), at(4)),
+            outbox.fail(7, confirmed.attempt(), at(1), at(4)),
             Err(Refusal::Stale)
         );
         assert_eq!(
-            outbox.fail(8, failed.attempt, at(1), at(4)),
+            outbox.fail(8, failed.attempt(), at(1), at(4)),
             Err(Refusal::Stale)
         );
-        assert_eq!(outbox.confirm(8, failed.attempt), Err(Refusal::Stale));
+        assert_eq!(outbox.confirm(8, failed.attempt()), Err(Refusal::Stale));
         // Refused before any record is looked up: the id does not matter.
-        assert_eq!(outbox.confirm(404, live.attempt), Err(Refusal::Stale));
+        assert_eq!(outbox.confirm(404, live.attempt()), Err(Refusal::Stale));
         assert_eq!(
-            outbox.fail(404, live.attempt, at(1), at(4)),
+            outbox.fail(404, live.attempt(), at(1), at(4)),
             Err(Refusal::Stale)
         );
         assert_eq!(*outbox, before);
@@ -75,15 +75,15 @@ fn an_attempt_from_another_outbox_settles_nothing() {
 
     // Each outbox still honours its own.
     assert_eq!(
-        near.confirm(9, near_live.attempt),
+        near.confirm(9, near_live.attempt()),
         Ok(Confirmation::Confirmed)
     );
     assert_eq!(
-        near.confirm(7, near_confirmed.attempt),
+        near.confirm(7, near_confirmed.attempt()),
         Ok(Confirmation::AlreadyConfirmed)
     );
     assert_eq!(
-        far.fail(8, far_failed.attempt, at(1), at(4)),
+        far.fail(8, far_failed.attempt(), at(1), at(4)),
         Ok(Failure::AlreadyFailed(Disposition::Retry(at(5))))
     );
 }
@@ -98,9 +98,12 @@ fn two_outboxes_left_in_one_scope_still_alias() {
     let mine = claim(&mut one, 1, 10);
     let theirs = claim(&mut other, 1, 10);
     assert_eq!(mine, theirs);
-    assert_eq!(one.confirm(9, theirs.attempt), Ok(Confirmation::Confirmed));
     assert_eq!(
-        one.confirm(7, other_confirmed.attempt),
+        one.confirm(9, theirs.attempt()),
+        Ok(Confirmation::Confirmed)
+    );
+    assert_eq!(
+        one.confirm(7, other_confirmed.attempt()),
         Ok(Confirmation::AlreadyConfirmed)
     );
 }
@@ -112,22 +115,22 @@ fn scope_zero_issues_the_plain_counter() {
     assert_eq!(outbox, Outbox::<2>::with_scope(max(3), 0));
     assert_eq!(outbox.enqueue(1, at(0)), Ok(Enqueue::Enqueued));
     assert_eq!(outbox.enqueue(2, at(0)), Ok(Enqueue::Enqueued));
-    let attempts = [claim(&mut outbox, 0, 5), claim(&mut outbox, 0, 5)].map(|c| c.attempt);
+    let attempts = [claim(&mut outbox, 0, 5), claim(&mut outbox, 0, 5)].map(|c| c.attempt());
     assert_eq!(attempts, [1, 2]);
 
     let mut scoped_box = Outbox::<2>::with_scope(max(3), 9);
     assert_eq!(scoped_box.scope(), 9);
     assert_eq!(scoped_box.enqueue(1, at(0)), Ok(Enqueue::Enqueued));
     let first = claim(&mut scoped_box, 0, 5);
-    assert_eq!((first.attempt, first.scope()), (scoped(9, 1), 9));
+    assert_eq!((first.attempt(), first.scope()), (scoped(9, 1), 9));
     assert_eq!(
-        scoped_box.get(1).and_then(|e| e.attempt),
+        scoped_box.get(1).and_then(|e| e.attempt()),
         Some(scoped(9, 1))
     );
     let mut out = [Expired::default(); 1];
     let sweep = scoped_box.expire_claims(at(5), 2, &mut out);
-    assert_eq!(sweep.map(|s| s.written), Ok(1));
-    assert_eq!((out[0].attempt, out[0].scope()), (scoped(9, 1), 9));
+    assert_eq!(sweep.map(|s| s.written()), Ok(1));
+    assert_eq!((out[0].attempt(), out[0].scope()), (scoped(9, 1), 9));
     // The plain counter of scope zero is foreign to it.
     assert_eq!(scoped_box.confirm(1, 1), Err(Refusal::Stale));
 }
@@ -138,14 +141,17 @@ fn the_last_attempt_is_issued_then_the_scope_is_spent() {
     assert_eq!(outbox.enqueue(1, at(0)), Ok(Enqueue::Enqueued));
     assert_eq!(outbox.enqueue(2, at(9)), Ok(Enqueue::Enqueued));
     let last = claim(&mut outbox, 9, 5);
-    assert_eq!((last.id, last.attempt), (1, u64::MAX));
+    assert_eq!((last.id(), last.attempt()), (1, u64::MAX));
     let before = outbox.clone();
     // The instant is not recorded either: the call changed nothing.
     assert_eq!(outbox.claim(at(50), at(5)), Err(Refusal::Exhausted));
     assert_eq!(outbox, before);
-    assert_eq!(outbox.get(2).map(|e| e.attempt), Some(None));
+    assert_eq!(outbox.get(2).map(|e| e.attempt()), Some(None));
     // The attempt already issued is still settled normally.
-    assert_eq!(outbox.confirm(1, last.attempt), Ok(Confirmation::Confirmed));
+    assert_eq!(
+        outbox.confirm(1, last.attempt()),
+        Ok(Confirmation::Confirmed)
+    );
     assert_eq!(outbox.forget(1), Ok(Forgetting::Forgotten));
     // With nothing due there is nothing to stamp, so the answer is honoured.
     let mut spent = resumed::<1>(1, 0, SEQUENCE_MAX);
@@ -159,7 +165,7 @@ fn an_attempt_this_outbox_never_issued_is_refused_before_any_lookup() {
     let mut outbox = Outbox::<2>::with_scope(max(3), 3);
     assert_eq!(outbox.enqueue(1, at(0)), Ok(Enqueue::Enqueued));
     let issued = claim(&mut outbox, 0, 10);
-    assert_eq!(issued.attempt, scoped(3, 1));
+    assert_eq!(issued.attempt(), scoped(3, 1));
     let before = outbox.clone();
     // In scope, but past what was issued, or the sequence zero no issuer
     // hands out: not ours, whatever the record id.
@@ -170,9 +176,9 @@ fn an_attempt_this_outbox_never_issued_is_refused_before_any_lookup() {
         assert_eq!(outbox.fail(1, never, at(1), at(4)), Err(Refusal::Stale));
     }
     // An attempt it did issue still reaches the lookup.
-    assert_eq!(outbox.confirm(404, issued.attempt), Err(Refusal::Unknown));
+    assert_eq!(outbox.confirm(404, issued.attempt()), Err(Refusal::Unknown));
     assert_eq!(
-        outbox.fail(404, issued.attempt, at(1), at(4)),
+        outbox.fail(404, issued.attempt(), at(1), at(4)),
         Err(Refusal::Unknown)
     );
     assert_eq!(outbox, before);
@@ -197,18 +203,21 @@ fn a_resumed_outbox_continues_the_sequence_it_saved() {
         assert_eq!((second.len(), second.max_attempts()), (0, 3));
         assert_eq!(second.enqueue(7, at(0)), Ok(Enqueue::Enqueued));
         let new = claim(&mut second, 0, 10);
-        assert_eq!(new.attempt, scoped(scope, 3));
+        assert_eq!(new.attempt(), scoped(scope, 3));
         assert_eq!(second.issued(), 3);
         let before = second.clone();
         // An attempt that outlived the restart is this outbox's own, and
         // names no claim made since.
         for late in old {
-            assert_eq!(second.confirm(7, late.attempt), Err(Refusal::Stale));
-            assert_eq!(second.confirm(8, late.attempt), Err(Refusal::Unknown));
+            assert_eq!(second.confirm(7, late.attempt()), Err(Refusal::Stale));
+            assert_eq!(second.confirm(8, late.attempt()), Err(Refusal::Unknown));
         }
         assert_eq!(second.confirm(8, scoped(scope, 4)), Err(Refusal::Stale));
         assert_eq!(second, before);
-        assert_eq!(second.confirm(7, new.attempt), Ok(Confirmation::Confirmed));
+        assert_eq!(
+            second.confirm(7, new.attempt()),
+            Ok(Confirmation::Confirmed)
+        );
     }
 }
 
@@ -220,13 +229,13 @@ fn a_restart_that_resumes_nothing_reissues_the_old_attempts() {
     let old = claim(&mut first, 0, 10);
     let mut again = Outbox::<1>::with_scope(max(3), 4);
     assert_eq!(again.enqueue(7, at(0)), Ok(Enqueue::Enqueued));
-    assert_eq!(claim(&mut again, 0, 10).attempt, old.attempt);
-    assert_eq!(again.confirm(7, old.attempt), Ok(Confirmation::Confirmed));
+    assert_eq!(claim(&mut again, 0, 10).attempt(), old.attempt());
+    assert_eq!(again.confirm(7, old.attempt()), Ok(Confirmation::Confirmed));
     // A new scope refuses the survivor instead.
     let mut moved = Outbox::<1>::with_scope(max(3), 5);
     assert_eq!(moved.enqueue(7, at(0)), Ok(Enqueue::Enqueued));
-    assert_ne!(claim(&mut moved, 0, 10).attempt, old.attempt);
-    assert_eq!(moved.confirm(7, old.attempt), Err(Refusal::Stale));
+    assert_ne!(claim(&mut moved, 0, 10).attempt(), old.attempt());
+    assert_eq!(moved.confirm(7, old.attempt()), Err(Refusal::Stale));
 }
 
 #[test]

@@ -30,9 +30,10 @@ small. Ids are `u64`; payloads live outside.
 - `enqueue(id, now) -> Result<Enqueue, Refusal>`: `Enqueued`, or `Duplicate`
   for an id that is already present (an idempotent repeat: honoured, nothing
   changes). An id stays taken, even when confirmed or dead, until
-  `forget(id)`. Refuses with `TimeRegression`, `Full` or `Exhausted`.
+  `forget(id)`. Refuses with `TimeRegression` or `Full`.
 - `claim(now, lease) -> Result<Option<Claimed>, Refusal>`: the due pending
-  record enqueued first, or `None` when nothing is due. `Claimed::attempt` is
+  record enqueued first (a forgotten record's slot goes to a newcomer, its
+  place in line does not), or `None` when nothing is due. `Claimed::attempt` is
   the identity of the attempt, drawn from one sequence for the whole outbox,
   starting at 1 and carried under the outbox's scope. Refuses with `TimeRegression`, `InvalidDuration`, or
   `Exhausted` when a record is due but that sequence is spent.
@@ -54,7 +55,7 @@ small. Ids are `u64`; payloads live outside.
   `retry_after` is not the one recorded.
 - `expire_claims(now, max_scan, out)`: reaps claims whose lease ended, into a
   caller buffer, with a persistent cursor. Bounded by `max_scan` and
-  `out.len()`; call again until `Sweep::complete`. Writes the first
+  `out.len()`; call again until `Sweep::pass()` is `Pass::Complete`. Writes the first
   `Sweep::written` entries of `out` and leaves the rest untouched. Build the
   buffer as `[Expired::default(); K]`: the default is a placeholder with
   attempt 0, which the outbox never emits. Refuses with `TimeRegression`.
@@ -145,10 +146,31 @@ whatever the id. The variants are
 changes nothing: no record, no sweep cursor, and not the observed clock.
 `Outbox` is `PartialEq`, so `outbox == clone_taken_before` proves it.
 
-The observed clock moves only when a call is honoured and takes effect. A
-`Duplicate` enqueue and an `AlreadyFailed` fail leave it alone. A `claim` that answers `None` and an
-`expire_claims` that reaps nothing were honoured answers about `now`, so they
-do record it.
+An honoured answer records `now` exactly when it depends on `now`:
+
+| Method | Records `now` | Leaves the clock alone |
+| --- | --- | --- |
+| `enqueue` | `Enqueued` (claimable from `now`) | `Duplicate` |
+| `claim` | `Some(Claimed)`, `None` (nothing due at `now`) | |
+| `confirm` | takes no time | `Confirmed`, `AlreadyConfirmed` |
+| `fail` | `Failed` (retries from `now`) | `AlreadyFailed` |
+| `expire_claims` | every `Sweep`, one that wrote nothing included | |
+| `forget` | takes no time | `Forgotten`, `NotHeld` |
+
+Every refusal leaves it alone.
+
+## Values
+
+`Claimed::new`, `Expired::new`, `Sweep::new` and `Entry::new` build a value
+only if some outbox could answer it, `None` otherwise: an attempt whose
+sequence is zero (no scope issues it), a `Claimed` whose lease ends at the
+epoch, a `Sweep` that wrote more than it scanned, an `Entry` whose attempt and
+claim count disagree or that is claimed, confirmed or dead without an attempt.
+Their fields are private and read through accessors of the same names
+(`Sweep::pass()` answers `Pass::Partial` or `Pass::Complete`), so no value
+skips that check; the Ruby gem validates every value it is handed through
+these constructors. `Expired::default()` is the output-buffer
+placeholder only.
 
 ## Ambiguous effects
 
@@ -163,13 +185,13 @@ use core::num::NonZeroU32;
 use core::time::Duration;
 use outbox_machines::{Confirmation, Disposition, Enqueue, Failure, Forgetting, Outbox, Refusal};
 
-let mut outbox = Outbox::<8>::new(NonZeroU32::new(3).unwrap());
+# fn main() -> Result<(), Refusal> {
+let mut outbox = Outbox::<8>::new(NonZeroU32::MIN.saturating_add(2));
 assert_eq!(outbox.enqueue(42, Duration::ZERO), Ok(Enqueue::Enqueued));
-let claimed = outbox
-    .claim(Duration::ZERO, Duration::from_secs(30))
-    .unwrap()
-    .unwrap();
-assert_eq!((claimed.id, claimed.attempt), (42, 1));
+let Some(claimed) = outbox.claim(Duration::ZERO, Duration::from_secs(30))? else {
+    return Ok(());
+};
+assert_eq!((claimed.id(), claimed.attempt()), (42, 1));
 let retry_at_5 = Disposition::Retry(Duration::from_secs(5));
 assert_eq!(
     outbox.fail(42, 1, Duration::ZERO, Duration::from_secs(5)),
@@ -183,8 +205,8 @@ assert_eq!(
     outbox.fail(42, 1, Duration::ZERO, Duration::from_secs(9)),
     Err(Refusal::Mismatch)
 );
-let retry = outbox.claim(Duration::from_secs(5), Duration::from_secs(30)).unwrap().unwrap();
-assert_eq!(retry.attempt, 2);
+let retry = outbox.claim(Duration::from_secs(5), Duration::from_secs(30))?;
+assert_eq!(retry.map(|c| c.attempt()), Some(2));
 assert_eq!(outbox.confirm(42, 1), Err(Refusal::Stale));
 assert_eq!(outbox.confirm(42, 2), Ok(Confirmation::Confirmed));
 assert_eq!(outbox.confirm(42, 2), Ok(Confirmation::AlreadyConfirmed));
@@ -194,8 +216,11 @@ assert_eq!(outbox.confirm(42, 2), Err(Refusal::Unknown));
 
 // The id is free again, but the identities its attempts used are not.
 assert_eq!(outbox.enqueue(42, Duration::from_secs(5)), Ok(Enqueue::Enqueued));
-let anew = outbox.claim(Duration::from_secs(5), Duration::from_secs(30)).unwrap().unwrap();
-assert_eq!((anew.attempt, outbox.get(42).unwrap().attempts), (3, 1));
+let anew = outbox.claim(Duration::from_secs(5), Duration::from_secs(30))?;
+assert_eq!(anew.map(|c| c.attempt()), Some(3));
+assert_eq!(outbox.get(42).map(|e| e.attempts()), Some(1));
 assert_eq!(outbox.confirm(42, 1), Err(Refusal::Stale));
 assert_eq!(outbox.confirm(42, 2), Err(Refusal::Stale));
+# Ok(())
+# }
 ```

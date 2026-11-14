@@ -264,7 +264,13 @@ fn run(seed: u64, scope: u16, tally: &mut Seen) {
             1 => {
                 let lease = 1 + rng.next(6);
                 let got = outbox.claim(at(now), at(lease));
-                let got = got.map(|c| c.map(|c| (c.id, c.attempt)));
+                if let Ok(Some(c)) = got {
+                    assert_eq!(
+                        Claimed::new(c.id(), c.attempt(), c.lease_expires()),
+                        Some(c)
+                    );
+                }
+                let got = got.map(|c| c.map(|c| (c.id(), c.attempt())));
                 if now < model.observed {
                     assert_eq!(got, Err(Refusal::TimeRegression), "seed {seed}");
                     false
@@ -301,7 +307,18 @@ fn run(seed: u64, scope: u16, tally: &mut Seen) {
         assert_eq!(outbox.observed, at(model.observed), "seed {seed}");
         assert_eq!(outbox.len(), model.rows.len());
         for row in &model.rows {
-            let entry = outbox.get(row.id).map(|e| (e.state, e.attempts, e.attempt));
+            let entry = outbox.get(row.id);
+            let rebuilt = entry.and_then(|e| {
+                Entry::new(
+                    e.id(),
+                    e.state(),
+                    e.attempts(),
+                    e.attempt(),
+                    e.available_at(),
+                )
+            });
+            assert_eq!(rebuilt, entry, "seed {seed}");
+            let entry = entry.map(|e| (e.state(), e.attempts(), e.attempt()));
             let attempt = (row.attempt != 0).then_some(row.attempt);
             assert_eq!(
                 entry,
@@ -397,8 +414,13 @@ fn sweep(outbox: &mut Outbox<5>, model: &mut Model, now: u64) {
         let Ok(sweep) = sweep else {
             panic!("time is monotonic")
         };
-        reaped.extend(out[..sweep.written].iter().map(|e| (e.id, e.attempt)));
-        if sweep.complete {
+        let rebuilt = Sweep::new(sweep.written(), sweep.scanned(), sweep.pass());
+        assert_eq!(rebuilt, Some(sweep));
+        for e in &out[..sweep.written()] {
+            assert_eq!(Expired::new(e.id(), e.attempt(), e.disposition()), Some(*e));
+        }
+        reaped.extend(out[..sweep.written()].iter().map(|e| (e.id(), e.attempt())));
+        if sweep.pass() == Pass::Complete {
             break;
         }
     }

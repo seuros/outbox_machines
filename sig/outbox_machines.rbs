@@ -1,5 +1,13 @@
 module OutboxMachines
   VERSION: String
+
+  # Private validating hooks behind the Data values.
+  def self.__retry: (untyped at) -> void
+  def self.__failure: (untyped disposition) -> void
+  def self.__claimed: (untyped id, untyped attempt, untyped lease_expires) -> void
+  def self.__expired: (untyped id, untyped attempt, untyped disposition) -> void
+  def self.__sweep: (untyped expired, untyped scanned, untyped pass) -> void
+  def self.__entry: (untyped id, untyped state, untyped attempts, untyped attempt, untyped available_at) -> void
   CAPACITY: Integer
 
   type state = :pending | :claimed | :confirmed | :dead
@@ -8,7 +16,8 @@ module OutboxMachines
   type disposition = Retry | :dead
 
   # The core's `Disposition::Retry(at)`: pending again, claimable at or after
-  # the instant `at`, in nanoseconds.
+  # the instant `at`, in nanoseconds. TypeError for a non-Integer, RangeError
+  # past what a Duration holds or negative.
   class Retry < Data
     attr_reader at: Integer
     def self.new: (Integer at) -> Retry
@@ -16,6 +25,8 @@ module OutboxMachines
   end
 
   # The core's `Failure::Failed(disposition)`: the live attempt is over.
+  # RangeError for a Symbol other than :dead, TypeError for anything else
+  # that is not a Retry (also for AlreadyFailed).
   class Failed < Data
     attr_reader disposition: disposition
     def self.new: (disposition disposition) -> Failed
@@ -31,7 +42,9 @@ module OutboxMachines
                 | (disposition: disposition) -> AlreadyFailed
   end
 
-  # Mirrors the core's `Entry`.
+  # Mirrors the core's `Entry`; `new` is held to `Entry::new` (RangeError
+  # when attempt is not nil exactly when attempts is 0, has sequence zero, or
+  # a non-pending record has no attempt; TypeError for a wrong type).
   class Entry < Data
     attr_reader id: Integer
     attr_reader state: state
@@ -45,7 +58,8 @@ module OutboxMachines
                 | (id: Integer, state: state, attempts: Integer, attempt: Integer?, available_at: Integer) -> Entry
   end
 
-  # Mirrors the core's `Claimed`.
+  # Mirrors the core's `Claimed`; `new` is held to `Claimed::new` (RangeError
+  # for attempt sequence zero or lease_expires 0; TypeError for a wrong type).
   class Claimed < Data
     attr_reader id: Integer
     # Identity of the attempt: issued once per outbox and never reissued. It
@@ -60,7 +74,8 @@ module OutboxMachines
     def scope: () -> Integer
   end
 
-  # Mirrors the core's `Expired`.
+  # Mirrors the core's `Expired`; `new` is held to `Expired::new` (RangeError
+  # for attempt sequence zero; the disposition is checked as Failed's).
   class Expired < Data
     attr_reader id: Integer
     attr_reader attempt: Integer
@@ -71,14 +86,21 @@ module OutboxMachines
     def scope: () -> Integer
   end
 
+  # The core's `Pass`: :complete once the cursor finished a full pass over
+  # every slot, cumulatively across calls; :partial until then.
+  type pass = :partial | :complete
+
   # Mirrors the core's `Sweep`. `expired` holds the reaped claims themselves,
-  # where the core reports how many it wrote to the caller's buffer.
+  # where the core reports how many it wrote to the caller's buffer. `new`
+  # keeps a frozen copy of the Array; RangeError when it holds more than
+  # `scanned` or `pass` is another Symbol, TypeError for a non-Expired element
+  # or a non-Symbol pass.
   class Sweep < Data
     attr_reader expired: Array[Expired]
     attr_reader scanned: Integer
-    attr_reader complete: bool
-    def self.new: (Array[Expired] expired, Integer scanned, bool complete) -> Sweep
-                | (expired: Array[Expired], scanned: Integer, complete: bool) -> Sweep
+    attr_reader pass: pass
+    def self.new: (Array[Expired] expired, Integer scanned, pass pass) -> Sweep
+                | (expired: Array[Expired], scanned: Integer, pass: pass) -> Sweep
   end
 
   class Outbox
@@ -110,20 +132,24 @@ module OutboxMachines
     # How many attempt identities this outbox has issued; also the sequence
     # number of the latest one. Save it to restart with Outbox.resumed.
     def issued: () -> Integer
-    # Private: what Claimed#scope and Expired#scope read.
+    # Private: what Claimed#scope and Expired#scope read. RangeError for an
+    # attempt of sequence zero.
     def self.__scope_of: (Integer attempt) -> Integer
     def capacity: () -> Integer
     def max_attempts: () -> Integer
     def size: () -> Integer
     def empty?: () -> bool
+    # TypeError for a non-Symbol, RangeError for a Symbol naming no state.
     def count: (state state) -> Integer
     # The record with this id, or nil. Never refuses.
     def get: (Integer id) -> Entry?
 
-    # Honoured: :enqueued, or :duplicate for an id that is already present.
-    def enqueue: (Integer id, Integer now) -> (:enqueued | :duplicate | :time_regression | :full | :exhausted)
+    # Honoured: :enqueued (records now), or :duplicate for an id that is
+    # already present (records nothing).
+    def enqueue: (Integer id, Integer now) -> (:enqueued | :duplicate | :time_regression | :full)
 
-    # Honoured: a Claimed, or nil when nothing is due. :exhausted means a
+    # Honoured: a Claimed, or nil when nothing is due; both record now.
+    # :exhausted means a
     # record is due but the outbox has issued every attempt identity of its
     # scope, 2**48-1 of them; it cannot be reached in practice.
     def claim: (Integer now, Integer lease) -> (Claimed | nil | :time_regression | :invalid_duration | :exhausted)
@@ -137,7 +163,7 @@ module OutboxMachines
     # includes an attempt of an earlier record that carried the same id.
     def confirm: (Integer id, Integer attempt) -> (:confirmed | :already_confirmed | :unknown | :stale)
 
-    # Honoured: a Failed, or an AlreadyFailed when `fail` already ended this
+    # Honoured: a Failed (records now), or an AlreadyFailed (records nothing) when `fail` already ended this
     # same attempt with this same retry_after and no claim followed (a repeat
     # that changes nothing and answers the standing disposition; `now` may
     # differ). The disposition is a Retry carrying the instant the record is
@@ -150,7 +176,9 @@ module OutboxMachines
     def fail: (Integer id, Integer attempt, Integer now, Integer retry_after)
             -> (Failed | AlreadyFailed | :unknown | :stale | :time_regression | :invalid_duration | :mismatch)
 
-    # Honoured: a Sweep of at most 16 Expired values, also when it reaped none.
+    # Honoured: a Sweep of at most 16 Expired values, also when it reaped
+    # none; it always records now. A max_scan past what the platform's usize
+    # holds raises RangeError rather than being narrowed.
     def expire_claims: (Integer now, Integer max_scan) -> (Sweep | :time_regression)
 
     # Honoured: :forgotten, or :not_held for an id the outbox does not hold (a

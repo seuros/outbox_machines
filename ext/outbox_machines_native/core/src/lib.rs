@@ -2,13 +2,15 @@
 #![doc = include_str!("../README.md")]
 
 mod refusal;
+mod values;
 
 use core::num::NonZeroU32;
 use core::time::Duration;
 
-use periscope_machines::{Issuer, scope_of};
+use periscope_machines::Issuer;
 
 pub use refusal::Refusal;
+pub use values::{Claimed, Disposition, Entry, Expired, Pass, Sweep};
 
 /// Delivery state of one record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,109 +65,12 @@ pub enum Forgetting {
     NotHeld,
 }
 
-/// A successful claim: the id plus the attempt identity that must accompany
-/// [`Outbox::confirm`] and [`Outbox::fail`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Claimed {
-    /// Claimed record id.
-    pub id: u64,
-    /// Identity of this attempt: issued once for the lifetime of the outbox
-    /// and never again, not even after the record is forgotten and its id
-    /// enqueued anew. It carries the outbox's scope above a sequence that
-    /// starts at 1, so scope zero issues 1, 2, 3. It is not the record's
-    /// attempt count; that is [`Entry::attempts`].
-    pub attempt: u64,
-    /// Instant at which the lease may be reaped by [`Outbox::expire_claims`].
-    pub lease_expires: Duration,
-}
-
-impl Claimed {
-    /// The scope of the outbox that issued this attempt, see
-    /// [`Outbox::with_scope`].
-    #[must_use]
-    pub const fn scope(&self) -> u16 {
-        scope_of(self.attempt)
-    }
-}
-
-/// Where a failed or expired attempt went.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Disposition {
-    /// Back to pending, claimable at or after the given instant.
-    Retry(Duration),
-    /// Attempts exhausted.
-    Dead,
-}
-
-/// One claim reaped by [`Outbox::expire_claims`].
-///
-/// An expired attempt is an *unknown* outcome: the worker may still be running
-/// or may have produced the external effect. Reconcile before assuming a retry
-/// is safe.
-///
-/// `Expired::default()` is a placeholder for pre-filling the output buffer:
-/// its attempt is 0, which no outbox of any scope issues, so the outbox never
-/// emits it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Expired {
-    /// Record id.
-    pub id: u64,
-    /// Identity of the attempt whose lease ran out.
-    pub attempt: u64,
-    /// What became of the record.
-    pub disposition: Disposition,
-}
-
-impl Expired {
-    /// The scope of the outbox that issued the reaped attempt.
-    #[must_use]
-    pub const fn scope(&self) -> u16 {
-        scope_of(self.attempt)
-    }
-}
-
-impl Default for Expired {
-    fn default() -> Self {
-        Self {
-            id: 0,
-            attempt: 0,
-            disposition: Disposition::Dead,
-        }
-    }
-}
-
-/// Progress of one bounded [`Outbox::expire_claims`] call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Sweep {
-    /// Entries written to the caller's buffer.
-    pub written: usize,
-    /// Slots examined by this call.
-    pub scanned: usize,
-    /// `true` once the cursor has completed a full pass over every slot,
-    /// cumulatively across calls. Call again until it is `true`.
-    pub complete: bool,
-}
-
-/// A read-only view of one record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Entry {
-    /// Record id.
-    pub id: u64,
-    /// Current state.
-    pub state: State,
-    /// Claims issued to this record so far; it dies at `max_attempts`.
-    pub attempts: u32,
-    /// Identity of the latest attempt, the one [`Claimed::attempt`] carried;
-    /// `None` until the record is first claimed.
-    pub attempt: Option<u64>,
-    /// Earliest instant a pending record may be claimed.
-    pub available_at: Duration,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Record {
     id: u64,
-    seq: u64,
+    /// Enqueue order among the records held: the held records carry exactly
+    /// `0..len`, so it never outgrows the capacity.
+    seq: usize,
     state: State,
     attempts: u32,
     /// Identity of the latest attempt; 0, which is never issued, until the
@@ -181,27 +86,19 @@ struct Record {
 }
 
 impl Record {
-    const fn disposition(&self) -> Disposition {
-        match self.state {
-            State::Dead => Disposition::Dead,
-            State::Pending | State::Claimed | State::Confirmed => {
-                Disposition::Retry(self.available_at)
-            }
-        }
-    }
-
     const fn view(&self) -> Entry {
-        Entry {
-            id: self.id,
-            state: self.state,
-            attempts: self.attempts,
-            attempt: if self.attempt == 0 {
-                None
-            } else {
-                Some(self.attempt)
-            },
-            available_at: self.available_at,
-        }
+        let attempt = if self.attempt == 0 {
+            None
+        } else {
+            Some(self.attempt)
+        };
+        Entry::held(
+            self.id,
+            self.state,
+            self.attempts,
+            attempt,
+            self.available_at,
+        )
     }
 }
 
@@ -216,7 +113,6 @@ pub struct Outbox<const N: usize> {
     slots: [Option<Record>; N],
     max_attempts: NonZeroU32,
     observed: Duration,
-    next_seq: u64,
     /// Issues the attempt identities; it also holds the outbox's scope.
     attempts: Issuer,
     cursor: usize,
@@ -245,7 +141,6 @@ impl<const N: usize> Outbox<N> {
             slots: [None; N],
             max_attempts,
             observed: Duration::ZERO,
-            next_seq: 0,
             attempts: Issuer::new(scope),
             cursor: 0,
             scanned_in_pass: 0,
@@ -328,15 +223,11 @@ impl<const N: usize> Outbox<N> {
     /// Snapshot of the record with this id.
     #[must_use]
     pub fn get(&self, id: u64) -> Option<Entry> {
-        self.find(id)
-            .and_then(|slot| self.slots[slot].as_ref())
-            .map(Record::view)
+        self.held(id).map(Record::view)
     }
 
-    fn find(&self, id: u64) -> Option<usize> {
-        self.slots
-            .iter()
-            .position(|slot| slot.as_ref().is_some_and(|record| record.id == id))
+    fn held(&self, id: u64) -> Option<&Record> {
+        self.slots.iter().flatten().find(|record| record.id == id)
     }
 
     fn check_time(&self, now: Duration) -> Result<(), Refusal> {
@@ -355,23 +246,21 @@ impl<const N: usize> Outbox<N> {
     ///
     /// # Errors
     /// [`Refusal::TimeRegression`] for backwards time (checked first, also for
-    /// a repeat), [`Refusal::Full`] when every slot is occupied,
-    /// [`Refusal::Exhausted`] when the enqueue sequence is spent.
+    /// a repeat), [`Refusal::Full`] when every slot is occupied.
     pub fn enqueue(&mut self, id: u64, now: Duration) -> Result<Enqueue, Refusal> {
         self.check_time(now)?;
-        if self.find(id).is_some() {
+        if self.held(id).is_some() {
             return Ok(Enqueue::Duplicate);
         }
+        // The newest record ranks after every held one.
+        let seq = self.len();
         let slot = self
             .slots
-            .iter()
-            .position(Option::is_none)
+            .iter_mut()
+            .find(|slot| slot.is_none())
             .ok_or(Refusal::Full)?;
-        let seq = self.next_seq;
-        let next = seq.checked_add(1).ok_or(Refusal::Exhausted)?;
         self.observed = now;
-        self.next_seq = next;
-        self.slots[slot] = Some(Record {
+        *slot = Some(Record {
             id,
             seq,
             state: State::Pending,
@@ -408,13 +297,11 @@ impl<const N: usize> Outbox<N> {
         }
         let pick = self
             .slots
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, record)| record.as_ref().map(|record| (slot, record)))
-            .filter(|(_, record)| record.state == State::Pending && record.available_at <= now)
-            .min_by_key(|(_, record)| record.seq)
-            .map(|(slot, _)| slot);
-        let Some(record) = pick.and_then(|slot| self.slots[slot].as_mut()) else {
+            .iter_mut()
+            .flatten()
+            .filter(|record| record.state == State::Pending && record.available_at <= now)
+            .min_by_key(|record| record.seq);
+        let Some(record) = pick else {
             self.observed = now;
             return Ok(None);
         };
@@ -428,11 +315,7 @@ impl<const N: usize> Outbox<N> {
         record.state = State::Claimed;
         record.lease_expires = lease_expires;
         record.failed = None;
-        Ok(Some(Claimed {
-            id: record.id,
-            attempt,
-            lease_expires,
-        }))
+        Ok(Some(Claimed::issued(record.id, attempt, lease_expires)))
     }
 
     /// An attempt this outbox never issued names nothing here: one of another
@@ -445,12 +328,22 @@ impl<const N: usize> Outbox<N> {
         }
     }
 
-    fn record(&mut self, id: u64) -> Result<&mut Record, Refusal> {
-        self.slots
+    /// The record `attempt` was issued to, in the order every report checks:
+    /// an attempt never issued here, then an id no record carries, then an
+    /// attempt that is not the record's latest.
+    fn reported(&mut self, id: u64, attempt: u64) -> Result<&mut Record, Refusal> {
+        self.check_issued(attempt)?;
+        let record = self
+            .slots
             .iter_mut()
             .flatten()
             .find(|record| record.id == id)
-            .ok_or(Refusal::Unknown)
+            .ok_or(Refusal::Unknown)?;
+        if record.attempt == attempt {
+            Ok(record)
+        } else {
+            Err(Refusal::Stale)
+        }
     }
 
     /// Caller asserts the external effect was persisted for this attempt.
@@ -472,11 +365,7 @@ impl<const N: usize> Outbox<N> {
     /// confirming one, which includes an attempt of an earlier record that
     /// carried this id.
     pub fn confirm(&mut self, id: u64, attempt: u64) -> Result<Confirmation, Refusal> {
-        self.check_issued(attempt)?;
-        let record = self.record(id)?;
-        if record.attempt != attempt {
-            return Err(Refusal::Stale);
-        }
+        let record = self.reported(id, attempt)?;
         match record.state {
             State::Claimed => {
                 record.state = State::Confirmed;
@@ -516,16 +405,18 @@ impl<const N: usize> Outbox<N> {
         now: Duration,
         retry_after: Duration,
     ) -> Result<Failure, Refusal> {
-        self.check_issued(attempt)?;
         let (observed, max) = (self.observed, self.max_attempts.get());
-        let record = self.record(id)?;
-        if record.attempt != attempt {
-            return Err(Refusal::Stale);
-        }
-        let recorded = match record.state {
-            State::Claimed => None,
-            State::Pending | State::Dead => Some(record.failed.ok_or(Refusal::Stale)?),
-            State::Confirmed => return Err(Refusal::Stale),
+        let record = self.reported(id, attempt)?;
+        // The standing disposition of an attempt `fail` already ended.
+        let standing = match (record.state, record.failed) {
+            (State::Claimed, _) => None,
+            (State::Pending, Some(recorded)) => {
+                Some((recorded, Disposition::Retry(record.available_at)))
+            }
+            (State::Dead, Some(recorded)) => Some((recorded, Disposition::Dead)),
+            (State::Pending | State::Dead, None) | (State::Confirmed, _) => {
+                return Err(Refusal::Stale);
+            }
         };
         if now < observed {
             return Err(Refusal::TimeRegression);
@@ -533,11 +424,11 @@ impl<const N: usize> Outbox<N> {
         let available_at = now
             .checked_add(retry_after)
             .ok_or(Refusal::InvalidDuration)?;
-        if let Some(recorded) = recorded {
+        if let Some((recorded, disposition)) = standing {
             if recorded != retry_after {
                 return Err(Refusal::Mismatch);
             }
-            return Ok(Failure::AlreadyFailed(record.disposition()));
+            return Ok(Failure::AlreadyFailed(disposition));
         }
         record.failed = Some(retry_after);
         let disposition = Self::settle(record, max, available_at);
@@ -548,11 +439,12 @@ impl<const N: usize> Outbox<N> {
     const fn settle(record: &mut Record, max: u32, available_at: Duration) -> Disposition {
         if record.attempts >= max {
             record.state = State::Dead;
+            Disposition::Dead
         } else {
             record.state = State::Pending;
             record.available_at = available_at;
+            Disposition::Retry(available_at)
         }
-        record.disposition()
     }
 
     /// Reap claims whose lease ended at or before `now`, writing at most
@@ -581,22 +473,18 @@ impl<const N: usize> Outbox<N> {
         let max = self.max_attempts.get();
         let (mut written, mut scanned) = (0, 0);
         while scanned < max_scan && self.scanned_in_pass < N {
-            let due = self.slots[self.cursor]
-                .as_ref()
-                .is_some_and(|r| r.state == State::Claimed && r.lease_expires <= now);
-            if due {
+            // `cursor < N` always; an empty slot and that impossible miss
+            // alike hold nothing to reap.
+            if let Some(Some(record)) = self.slots.get_mut(self.cursor)
+                && record.state == State::Claimed
+                && record.lease_expires <= now
+            {
                 let Some(entry) = out.get_mut(written) else {
                     break;
                 };
-                if let Some(record) = self.slots[self.cursor].as_mut() {
-                    let disposition = Self::settle(record, max, now);
-                    *entry = Expired {
-                        id: record.id,
-                        attempt: record.attempt,
-                        disposition,
-                    };
-                    written += 1;
-                }
+                let disposition = Self::settle(record, max, now);
+                *entry = Expired::reaped(record.id, record.attempt, disposition);
+                written += 1;
             }
             scanned += 1;
             self.scanned_in_pass += 1;
@@ -606,11 +494,12 @@ impl<const N: usize> Outbox<N> {
         if complete {
             self.scanned_in_pass = 0;
         }
-        Ok(Sweep {
-            written,
-            scanned,
-            complete,
-        })
+        let pass = if complete {
+            Pass::Complete
+        } else {
+            Pass::Partial
+        };
+        Ok(Sweep::swept(written, scanned, pass))
     }
 
     /// Drop a confirmed or dead record, freeing its slot and its id.
@@ -625,20 +514,24 @@ impl<const N: usize> Outbox<N> {
     /// # Errors
     /// [`Refusal::NotTerminal`] for a pending or claimed record.
     pub fn forget(&mut self, id: u64) -> Result<Forgetting, Refusal> {
+        let Some(record) = self.held(id) else {
+            return Ok(Forgetting::NotHeld);
+        };
+        match record.state {
+            State::Confirmed | State::Dead => {}
+            State::Pending | State::Claimed => return Err(Refusal::NotTerminal),
+        }
+        // Ranks are unique: drop that one and close the gap, so the held
+        // records keep ranks `0..len`.
+        let gone = record.seq;
         for slot in &mut self.slots {
-            if let Some(record) = slot
-                && record.id == id
-            {
-                return match record.state {
-                    State::Confirmed | State::Dead => {
-                        *slot = None;
-                        Ok(Forgetting::Forgotten)
-                    }
-                    State::Pending | State::Claimed => Err(Refusal::NotTerminal),
-                };
+            match slot {
+                Some(record) if record.seq == gone => *slot = None,
+                Some(record) if record.seq > gone => record.seq -= 1,
+                Some(_) | None => {}
             }
         }
-        Ok(Forgetting::NotHeld)
+        Ok(Forgetting::Forgotten)
     }
 }
 

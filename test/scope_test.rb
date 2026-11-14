@@ -42,6 +42,7 @@ class ScopeTest < Minitest::Test
     expired = box.expire_claims(5, 64).expired
     assert_equal [[claimed.attempt, 9]], expired.map { [it.attempt, it.scope] }
     assert_raises(NoMethodError) { Outbox.__scope_of(1) }
+    assert_raises(RangeError) { Outbox.__send__(:__scope_of, 9 << 48) }
     assert_equal 65_535, Outbox.with_scope(1, 65_535).scope
   end
 

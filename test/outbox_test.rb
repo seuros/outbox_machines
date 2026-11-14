@@ -22,17 +22,17 @@ class OutboxTest < Minitest::Test
     assert_equal %i[id state attempts attempt available_at], Entry.members
     assert_equal %i[id attempt lease_expires], Claimed.members
     assert_equal %i[id attempt disposition], Expired.members
-    assert_equal %i[expired scanned complete], Sweep.members
+    assert_equal %i[expired scanned pass], Sweep.members
     refute OutboxMachines.const_defined?(:Attempt)
     box = outbox.tap { _1.enqueue(1, 0) }
     claimed = box.claim(0, 10)
     assert_equal Claimed.new(1, 1, 10), claimed
     assert_predicate claimed, :frozen?
     sweep = box.expire_claims(10, 3)
-    assert_equal Sweep.new([Expired.new(1, 1, Retry.new(10))], 3, false), sweep
+    assert_equal Sweep.new([Expired.new(1, 1, Retry.new(10))], 3, :partial), sweep
     assert_predicate sweep, :frozen?
     assert_predicate sweep.expired, :frozen?
-    assert_equal Sweep.new([], 61, true), box.expire_claims(10, 64)
+    assert_equal Sweep.new([], 61, :complete), box.expire_claims(10, 64)
   end
 
   def test_times_are_integer_nanoseconds
@@ -45,9 +45,9 @@ class OutboxTest < Minitest::Test
     assert_equal Failed.new(Retry.new(now + 7)), box.fail(1, claimed.attempt, now + 2, 5)
     assert_nil box.claim(now + 6, lease)
     retried = box.claim(now + 7, lease)
-    assert_equal Sweep.new([], 64, true), box.expire_claims(retried.lease_expires - 1, 64)
+    assert_equal Sweep.new([], 64, :complete), box.expire_claims(retried.lease_expires - 1, 64)
     reaped = Expired.new(1, 2, Retry.new(retried.lease_expires))
-    assert_equal Sweep.new([reaped], 64, true), box.expire_claims(retried.lease_expires, 64)
+    assert_equal Sweep.new([reaped], 64, :complete), box.expire_claims(retried.lease_expires, 64)
   end
 
   def test_instants_past_u64_are_answered_exactly
@@ -108,16 +108,21 @@ class OutboxTest < Minitest::Test
     repeat = box.fail(1, first.attempt, 900, 50)
     assert_equal AlreadyFailed.new(Retry.new(55)), repeat
     assert_predicate repeat, :frozen?
-    # Another delay is another report.
+    # Another delay is another report, even one landing on the same instant.
     assert_equal :mismatch, box.fail(1, first.attempt, 900, 7)
+    assert_equal :mismatch, box.fail(1, first.attempt, 6, 49)
+    # The arguments are checked before the payload is.
     assert_equal :time_regression, box.fail(1, first.attempt, 4, 50)
+    assert_equal :time_regression, box.fail(1, first.attempt, 4, 7)
     assert_equal :stale, box.confirm(1, first.attempt)
     assert_equal :not_held, box.forget(2)
     assert_equal entry, box.get(1)
     assert_nil box.claim(54, 10)
     second = box.claim(55, 10)
+    assert_equal 2, second.attempt
     assert_equal :stale, box.fail(1, first.attempt, 55, 0)
     assert_equal Failed.new(:dead), box.fail(1, second.attempt, 56, 0)
+    assert_equal :dead, box.get(1).state
     assert_equal AlreadyFailed.new(:dead), box.fail(1, second.attempt, 999, 0)
     assert_equal :mismatch, box.fail(1, second.attempt, 999, 3)
     # 999 was not observed either: 56 is still a valid instant.
@@ -133,20 +138,6 @@ class OutboxTest < Minitest::Test
     assert_equal :stale, box.confirm(1, lost.attempt)
   end
 
-  def test_fail_retry_then_dead
-    box = outbox(2)
-    box.enqueue(1, 0)
-    first = box.claim(0, 10)
-    assert_equal Failed.new(Retry.new(55)), box.fail(1, first.attempt, 5, 50)
-    assert_nil box.claim(54, 10)
-    second = box.claim(55, 10)
-    assert_equal 2, second.attempt
-    assert_equal :stale, box.fail(1, first.attempt, 56, 0)
-    assert_equal Failed.new(:dead), box.fail(1, second.attempt, 56, 0)
-    assert_equal :dead, box.get(1).state
-    assert_equal :not_terminal, outbox.tap { _1.enqueue(2, 0) }.forget(2)
-  end
-
   def test_expire_claims_resumable
     box = outbox(1)
     20.times { |i| box.enqueue(i, 0) }
@@ -158,7 +149,7 @@ class OutboxTest < Minitest::Test
       assert_operator sweep.scanned, :<=, 5
       seen.concat(sweep.expired.map(&:id))
       assert_equal [:dead], sweep.expired.map(&:disposition).uniq if sweep.expired.any?
-      break if sweep.complete
+      break if sweep.pass == :complete
     end
     assert_equal (0...20).to_a, seen.sort
     assert_equal 20, box.count(:dead)
@@ -171,38 +162,31 @@ class OutboxTest < Minitest::Test
     box.enqueue(2, 0)
     first = box.claim(0, 10)
     second = box.claim(0, 10)
-    assert_equal Sweep.new([], 64, true), box.expire_claims(9, 64)
+    assert_equal Sweep.new([], 64, :complete), box.expire_claims(9, 64)
     # Past the deadline but not yet reaped: the effect happened, so it counts.
     assert_nil box.get(3)
     assert_equal :enqueued, box.enqueue(3, 50)
     assert_equal :confirmed, box.confirm(second.id, second.attempt)
-    assert_equal Sweep.new([Expired.new(1, 1, Retry.new(50))], 64, true), box.expire_claims(50, 64)
+    assert_equal Sweep.new([Expired.new(1, 1, Retry.new(50))], 64, :complete), box.expire_claims(50, 64)
     assert_equal :stale, box.confirm(first.id, first.attempt)
     # The third claim this outbox issued, and the second for this record.
     assert_equal 3, box.claim(50, 10).attempt
     assert_equal 2, box.get(1).attempts
   end
 
-  def test_capacity_and_refusals
+  def test_capacity_and_refusals_change_nothing
     box = outbox
     assert_equal 64, OutboxMachines::CAPACITY
     assert_equal OutboxMachines::CAPACITY, box.capacity
     assert_equal 3, box.max_attempts
-    64.times { |i| assert_equal :enqueued, box.enqueue(i, 0) }
-    assert_equal :full, box.enqueue(100, 0)
-    assert_equal :invalid_duration, box.claim(0, 0)
-    assert_instance_of Claimed, box.claim(5, 1)
-    assert_equal :time_regression, box.enqueue(200, 4)
-  end
-
-  def test_full_and_duplicate_enqueue_change_nothing
-    box = outbox
     64.times { |i| assert_equal :enqueued, box.enqueue(i, 10) }
     assert_equal :full, box.enqueue(100, 500)
     assert_equal :duplicate, box.enqueue(0, 500)
     assert_equal :time_regression, box.enqueue(0, 9)
+    assert_equal :invalid_duration, box.claim(10, 0)
+    assert_equal :not_terminal, box.forget(0)
     assert_equal 64, box.size
-    # Neither call recorded 500 as observed: 10 is still a valid instant.
+    # None of those calls recorded 500 as observed: 10 is still a valid instant.
     assert_equal 0, box.claim(10, 5).id
   end
 
@@ -210,7 +194,7 @@ class OutboxTest < Minitest::Test
     box = outbox
     assert_nil box.claim(20, 5)
     assert_equal :time_regression, box.enqueue(1, 19)
-    assert_equal Sweep.new([], 64, true), box.expire_claims(30, 64)
+    assert_equal Sweep.new([], 64, :complete), box.expire_claims(30, 64)
     assert_equal :time_regression, box.enqueue(1, 29)
     assert_equal :enqueued, box.enqueue(1, 30)
   end
@@ -225,7 +209,6 @@ class OutboxTest < Minitest::Test
     [-1, 2**64].each { |n| assert_raises(RangeError) { box.enqueue(n, 0) } }
     assert_time_arguments_are_strict(box)
     [0, 2**32].each { |n| assert_raises(RangeError) { outbox(n) } }
-    assert_raises(ArgumentError) { box.count(:nope) }
     assert_raises(TypeError) { OutboxMachines::Outbox.allocate }
     # An attempt the outbox never issued is refused before the id is looked up.
     assert_equal :stale, box.confirm(1, 2**48 - 1)

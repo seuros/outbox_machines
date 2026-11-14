@@ -20,8 +20,8 @@ pub enum Refusal {
     TimeRegression,
     /// A zero lease or an instant that overflows [`Duration`].
     InvalidDuration,
-    /// The enqueue sequence or the attempt sequence is spent: the outbox can
-    /// admit no further record, or its scope has no attempt identity left.
+    /// The scope has no attempt identity left, so a due record cannot be
+    /// claimed. Answered by [`Outbox::claim`](crate::Outbox::claim) only.
     Exhausted,
     /// Every slot is occupied; nothing was evicted.
     Full,
@@ -38,7 +38,7 @@ impl core::fmt::Display for Refusal {
             Self::NotTerminal => "the record is not confirmed or dead",
             Self::TimeRegression => "now is earlier than an observed instant",
             Self::InvalidDuration => "zero lease or overflowing instant",
-            Self::Exhausted => "the enqueue or attempt sequence is spent",
+            Self::Exhausted => "the attempt sequence is spent",
             Self::Full => "every slot is occupied",
             Self::Mismatch => "retry_after is not the one recorded for this attempt",
         })

@@ -7,7 +7,6 @@ require 'outbox_machines'
 class ReissueTest < Minitest::Test
   Failed = OutboxMachines::Failed
   AlreadyFailed = OutboxMachines::AlreadyFailed
-  Retry = OutboxMachines::Retry
 
   def test_a_report_from_a_forgotten_life_cannot_settle_the_new_one
     box = OutboxMachines::Outbox.new(3)
@@ -51,21 +50,6 @@ class ReissueTest < Minitest::Test
       assert_equal :stale, box.confirm(7, old)
       assert_equal :stale, box.fail(8, old, 0, 0)
     end
-  end
-
-  def test_a_repeated_fail_with_another_retry_after_is_a_mismatch
-    box = OutboxMachines::Outbox.new(3)
-    box.enqueue(1, 0)
-    first = box.claim(0, 10)
-    assert_equal Failed.new(Retry.new(55)), box.fail(1, first.attempt, 5, 50)
-    entry = box.get(1)
-    assert_equal :mismatch, box.fail(1, first.attempt, 900, 7)
-    assert_equal :mismatch, box.fail(1, first.attempt, 6, 49)
-    assert_equal :time_regression, box.fail(1, first.attempt, 4, 7)
-    assert_equal AlreadyFailed.new(Retry.new(55)), box.fail(1, first.attempt, 900, 50)
-    assert_equal entry, box.get(1)
-    # 900 was never observed: 55 is still a valid instant.
-    assert_equal 1, box.claim(55, 10).id
   end
 
   private
