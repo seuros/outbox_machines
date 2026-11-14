@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.0](https://github.com/seuros/outbox_machines/compare/outbox_machines/v0.5.0...outbox_machines/v0.6.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* adopt matryona-machines 0.2 and check frozen before converting arguments
+
+### Features
+
+* adopt matryona-machines 0.2 and check frozen before converting arguments ([06553b9](https://github.com/seuros/outbox_machines/commit/06553b93b8b47b79289cb85c1da24b44248146a0))
+
 ## [0.5.0](https://github.com/seuros/outbox_machines/compare/outbox_machines/v0.4.0...outbox_machines/v0.5.0) (2026-11-14)
 
 
