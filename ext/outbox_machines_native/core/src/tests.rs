@@ -1,6 +1,7 @@
 use super::*;
 use core::assert_matches;
 use core::num::NonZeroU32;
+use matryona_machines::testing::refuses;
 use std::vec::Vec;
 
 fn at(ms: u64) -> Duration {
@@ -194,53 +195,59 @@ fn refusals_leave_the_table_untouched() {
     assert_eq!(outbox.enqueue(0, at(10)), Ok(Enqueue::Enqueued));
     let c = claim(&mut outbox, 10, 5);
     assert_eq!(c.id(), u64::MAX);
-    let before = outbox.clone();
     let mut out = [];
-    assert_eq!(outbox.enqueue(5, at(9)), Err(Refusal::TimeRegression));
-    assert_eq!(outbox.enqueue(0, at(9)), Err(Refusal::TimeRegression));
-    assert_eq!(outbox.enqueue(5, at(99)), Err(Refusal::Full));
-    assert_eq!(outbox.claim(at(9), at(1)), Err(Refusal::TimeRegression));
-    assert_eq!(
-        outbox.claim(at(10), Duration::ZERO),
-        Err(Refusal::InvalidDuration)
-    );
-    assert_eq!(
-        outbox.claim(at(10), Duration::MAX),
-        Err(Refusal::InvalidDuration)
-    );
-    assert_eq!(
-        outbox.claim(Duration::MAX, at(1)),
-        Err(Refusal::InvalidDuration)
-    );
-    assert_eq!(outbox.confirm(7, 1), Err(Refusal::Unknown));
-    assert_eq!(outbox.confirm(u64::MAX, 2), Err(Refusal::Stale));
-    assert_eq!(outbox.confirm(u64::MAX, 0), Err(Refusal::Stale));
-    assert_eq!(outbox.confirm(0, 0), Err(Refusal::Stale));
-    assert_eq!(outbox.confirm(0, 1), Err(Refusal::Stale));
-    assert_eq!(outbox.fail(7, 1, at(10), at(0)), Err(Refusal::Unknown));
-    assert_eq!(
-        outbox.fail(u64::MAX, u64::MAX, at(10), at(0)),
-        Err(Refusal::Stale)
-    );
-    assert_eq!(
-        outbox.fail(u64::MAX, 1, at(9), at(0)),
-        Err(Refusal::TimeRegression)
-    );
-    assert_eq!(
-        outbox.fail(u64::MAX, 1, at(10), Duration::MAX),
-        Err(Refusal::InvalidDuration)
-    );
-    assert_eq!(
-        outbox.fail(u64::MAX, 1, Duration::MAX, at(1)),
-        Err(Refusal::InvalidDuration)
-    );
-    assert_eq!(
-        outbox.expire_claims(at(9), 2, &mut out),
-        Err(Refusal::TimeRegression)
-    );
-    assert_eq!(outbox.forget(0), Err(Refusal::NotTerminal));
-    assert_eq!(outbox.forget(u64::MAX), Err(Refusal::NotTerminal));
-    assert_eq!(outbox, before);
+    refuses(&mut outbox, Refusal::TimeRegression, |outbox| {
+        outbox.enqueue(5, at(9))
+    });
+    refuses(&mut outbox, Refusal::TimeRegression, |outbox| {
+        outbox.enqueue(0, at(9))
+    });
+    refuses(&mut outbox, Refusal::Full, |outbox| {
+        outbox.enqueue(5, at(99))
+    });
+    refuses(&mut outbox, Refusal::TimeRegression, |outbox| {
+        outbox.claim(at(9), at(1))
+    });
+    refuses(&mut outbox, Refusal::InvalidDuration, |outbox| {
+        outbox.claim(at(10), Duration::ZERO)
+    });
+    refuses(&mut outbox, Refusal::InvalidDuration, |outbox| {
+        outbox.claim(at(10), Duration::MAX)
+    });
+    refuses(&mut outbox, Refusal::InvalidDuration, |outbox| {
+        outbox.claim(Duration::MAX, at(1))
+    });
+    refuses(&mut outbox, Refusal::Unknown, |outbox| outbox.confirm(7, 1));
+    refuses(&mut outbox, Refusal::Stale, |outbox| {
+        outbox.confirm(u64::MAX, 2)
+    });
+    refuses(&mut outbox, Refusal::Stale, |outbox| {
+        outbox.confirm(u64::MAX, 0)
+    });
+    refuses(&mut outbox, Refusal::Stale, |outbox| outbox.confirm(0, 0));
+    refuses(&mut outbox, Refusal::Stale, |outbox| outbox.confirm(0, 1));
+    refuses(&mut outbox, Refusal::Unknown, |outbox| {
+        outbox.fail(7, 1, at(10), at(0))
+    });
+    refuses(&mut outbox, Refusal::Stale, |outbox| {
+        outbox.fail(u64::MAX, u64::MAX, at(10), at(0))
+    });
+    refuses(&mut outbox, Refusal::TimeRegression, |outbox| {
+        outbox.fail(u64::MAX, 1, at(9), at(0))
+    });
+    refuses(&mut outbox, Refusal::InvalidDuration, |outbox| {
+        outbox.fail(u64::MAX, 1, at(10), Duration::MAX)
+    });
+    refuses(&mut outbox, Refusal::InvalidDuration, |outbox| {
+        outbox.fail(u64::MAX, 1, Duration::MAX, at(1))
+    });
+    refuses(&mut outbox, Refusal::TimeRegression, |outbox| {
+        outbox.expire_claims(at(9), 2, &mut out)
+    });
+    refuses(&mut outbox, Refusal::NotTerminal, |outbox| outbox.forget(0));
+    refuses(&mut outbox, Refusal::NotTerminal, |outbox| {
+        outbox.forget(u64::MAX)
+    });
 }
 
 #[test]

@@ -6,9 +6,9 @@ use super::*;
 fn a_full_enqueue_changes_nothing() {
     let mut outbox = Outbox::<1>::new(max(2));
     assert_eq!(outbox.enqueue(1, at(10)), Ok(Enqueue::Enqueued));
-    let before = outbox.clone();
-    assert_eq!(outbox.enqueue(2, at(500)), Err(Refusal::Full));
-    assert_eq!(outbox, before);
+    refuses(&mut outbox, Refusal::Full, |outbox| {
+        outbox.enqueue(2, at(500))
+    });
     // The refused instant was not recorded: time in between is still fine.
     assert_eq!(
         outbox.claim(at(10), at(5)).map(|c| c.map(|c| c.id())),
@@ -34,27 +34,25 @@ fn id_and_attempt_refusals_do_not_record_the_instant() {
     let mut outbox = Outbox::<2>::new(max(2));
     assert_eq!(outbox.enqueue(1, at(10)), Ok(Enqueue::Enqueued));
     let c = claim(&mut outbox, 10, 5);
-    let before = outbox.clone();
-    assert_eq!(outbox.fail(9, 1, at(500), at(0)), Err(Refusal::Unknown));
-    assert_eq!(
-        outbox.fail(1, c.attempt() + 1, at(500), at(0)),
-        Err(Refusal::Stale)
-    );
-    assert_eq!(
-        outbox.fail(1, c.attempt(), at(500), Duration::MAX),
-        Err(Refusal::InvalidDuration)
-    );
-    assert_eq!(
-        outbox.claim(at(500), Duration::ZERO),
-        Err(Refusal::InvalidDuration)
-    );
-    assert_eq!(
-        outbox.claim(at(500), Duration::MAX),
-        Err(Refusal::InvalidDuration)
-    );
-    assert_eq!(outbox.confirm(1, c.attempt() + 1), Err(Refusal::Stale));
-    assert_eq!(outbox.forget(1), Err(Refusal::NotTerminal));
-    assert_eq!(outbox, before);
+    refuses(&mut outbox, Refusal::Unknown, |outbox| {
+        outbox.fail(9, 1, at(500), at(0))
+    });
+    refuses(&mut outbox, Refusal::Stale, |outbox| {
+        outbox.fail(1, c.attempt() + 1, at(500), at(0))
+    });
+    refuses(&mut outbox, Refusal::InvalidDuration, |outbox| {
+        outbox.fail(1, c.attempt(), at(500), Duration::MAX)
+    });
+    refuses(&mut outbox, Refusal::InvalidDuration, |outbox| {
+        outbox.claim(at(500), Duration::ZERO)
+    });
+    refuses(&mut outbox, Refusal::InvalidDuration, |outbox| {
+        outbox.claim(at(500), Duration::MAX)
+    });
+    refuses(&mut outbox, Refusal::Stale, |outbox| {
+        outbox.confirm(1, c.attempt() + 1)
+    });
+    refuses(&mut outbox, Refusal::NotTerminal, |outbox| outbox.forget(1));
 }
 
 #[test]

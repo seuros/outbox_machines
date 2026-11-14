@@ -1,6 +1,7 @@
 //! Randomized runs against an independent naive model.
 
 use super::*;
+use matryona_machines::testing::SplitMix64;
 use periscope_machines::{scope_of, scoped, sequence_of};
 
 #[derive(Clone, Copy)]
@@ -171,18 +172,6 @@ struct Issued {
     life: u64,
 }
 
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self, bound: u64) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        (self.0 >> 33) % bound
-    }
-}
-
 /// What the run must have exercised, counted across every seed.
 #[derive(Debug, Default)]
 struct Seen {
@@ -228,7 +217,7 @@ fn behaves_like_the_reference_model() {
 }
 
 fn run(seed: u64, scope: u16, tally: &mut Seen) {
-    let mut rng = Rng(seed);
+    let mut rng = SplitMix64::new(seed);
     let mut outbox = Outbox::<5>::with_scope(max(3), scope);
     assert_eq!(outbox.scope(), scope);
     let mut model = Model {
@@ -245,16 +234,16 @@ fn run(seed: u64, scope: u16, tally: &mut Seen) {
     // outlive the forgetting and re-enqueueing of their id.
     let mut issued: Vec<Issued> = Vec::new();
     for _ in 0..400 {
-        clock += rng.next(4);
+        clock += rng.below(4);
         // One call in four is handed a possibly stale instant.
-        let now = if rng.next(4) == 0 {
-            clock.saturating_sub(rng.next(6))
+        let now = if rng.below(4) == 0 {
+            clock.saturating_sub(rng.below(6))
         } else {
             clock
         };
-        let id = rng.next(8);
+        let id = rng.below(8);
         let before = outbox.clone();
-        let changed = match rng.next(6) {
+        let changed = match rng.below(6) {
             0 => {
                 let got = outbox.enqueue(id, at(now));
                 assert_eq!(got, model.enqueue(id, now), "seed {seed}");
@@ -262,7 +251,7 @@ fn run(seed: u64, scope: u16, tally: &mut Seen) {
                 got == Ok(Enqueue::Enqueued)
             }
             1 => {
-                let lease = 1 + rng.next(6);
+                let lease = 1 + rng.below(6);
                 let got = outbox.claim(at(now), at(lease));
                 if let Ok(Some(c)) = got {
                     assert_eq!(
@@ -331,38 +320,38 @@ fn run(seed: u64, scope: u16, tally: &mut Seen) {
 
 /// One `confirm` or `fail`; `true` when it changed the outbox.
 fn report(
-    rng: &mut Rng,
+    rng: &mut SplitMix64,
     outbox: &mut Outbox<5>,
     model: &mut Model,
     issued: &[Issued],
     (id, now): (u64, u64),
     tally: &mut Seen,
 ) -> bool {
-    let confirm = rng.next(3) == 0;
+    let confirm = rng.below(3) == 0;
     // Few distinct delays, so a repeated `fail` both matches and mismatches.
-    let retry = rng.next(3);
+    let retry = rng.below(3);
     // Half the reports name the latest claim, so that repeats of one attempt
     // are common; a quarter replay any attempt ever issued, however old; the
     // rest are guesses.
     let guess = Issued {
         id,
-        attempt: scoped(model.scope, rng.next(model.next_attempt + 2)),
+        attempt: scoped(model.scope, rng.below(model.next_attempt + 2)),
         life: u64::MAX,
     };
-    let named = match (rng.next(4), issued.last()) {
+    let named = match (rng.below(4), issued.last()) {
         (0 | 1, Some(latest)) => *latest,
         (2, Some(_)) => {
-            let pick = rng.next(issued.len() as u64);
+            let pick = rng.below(issued.len() as u64);
             issued[usize::try_from(pick).unwrap_or(0)]
         }
         (0..=2, None) | (3.., _) => guess,
     };
     // One report in eight comes from an outbox of another scope that issued
     // the same sequence number: the same record id, a different identity.
-    let named = if rng.next(8) == 0 {
+    let named = if rng.below(8) == 0 {
         tally.foreign += 1;
         // Flipping low scope bits always lands in another scope.
-        let flip = [1u16, 2, 3][usize::try_from(rng.next(3)).unwrap_or(0)];
+        let flip = [1u16, 2, 3][usize::try_from(rng.below(3)).unwrap_or(0)];
         tally.foreign_on_held += usize::from(model.rows.iter().any(|r| r.id == named.id));
         Issued {
             attempt: named.attempt ^ scoped(flip, 0),

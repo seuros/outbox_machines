@@ -14,25 +14,23 @@ fn a_report_from_a_forgotten_life_cannot_settle_the_new_one() {
     assert_eq!(outbox.forget(7), Ok(Forgetting::Forgotten));
     assert_eq!(outbox.enqueue(7, at(0)), Ok(Enqueue::Enqueued));
     // Held but not claimed yet: the old identity names nothing live.
-    let before = outbox.clone();
-    assert_eq!(outbox.confirm(7, old.attempt()), Err(Refusal::Stale));
-    assert_eq!(
-        outbox.fail(7, old.attempt(), at(0), at(0)),
-        Err(Refusal::Stale)
-    );
-    assert_eq!(outbox, before);
+    refuses(&mut outbox, Refusal::Stale, |outbox| {
+        outbox.confirm(7, old.attempt())
+    });
+    refuses(&mut outbox, Refusal::Stale, |outbox| {
+        outbox.fail(7, old.attempt(), at(0), at(0))
+    });
     let fresh = claim(&mut outbox, 0, 10);
     assert_ne!(fresh.attempt(), old.attempt());
     // The record's own count restarted; the identity did not.
     let entry = outbox.get(7).map(|e| (e.attempts(), e.attempt()));
     assert_eq!(entry, Some((1, Some(fresh.attempt()))));
-    let before = outbox.clone();
-    assert_eq!(outbox.confirm(7, old.attempt()), Err(Refusal::Stale));
-    assert_eq!(
-        outbox.fail(7, old.attempt(), at(0), at(0)),
-        Err(Refusal::Stale)
-    );
-    assert_eq!(outbox, before);
+    refuses(&mut outbox, Refusal::Stale, |outbox| {
+        outbox.confirm(7, old.attempt())
+    });
+    refuses(&mut outbox, Refusal::Stale, |outbox| {
+        outbox.fail(7, old.attempt(), at(0), at(0))
+    });
     assert_eq!(outbox.get(7).map(|e| e.state()), Some(State::Claimed));
     assert_eq!(
         outbox.confirm(7, fresh.attempt()),

@@ -54,6 +54,15 @@ class SealTest < Minitest::Test
     assert_raises(TypeError) { Sweep.new([Expired.new(7, 1, :dead), 1], 5, :partial) }
   end
 
+  # A singleton class opened on a genuine value does not change what it is,
+  # for a value read back or an Array of them.
+  def test_an_opened_singleton_class_is_still_the_gems_value
+    retry_at = Retry.new(5).tap(&:singleton_class)
+    assert_equal Failed.new(Retry.new(5)), Failed.new(retry_at)
+    reaped = Expired.new(1, 1, :dead).tap(&:singleton_class)
+    assert_equal 1, Sweep.new([reaped].tap(&:singleton_class).freeze, 1, :partial).expired.size
+  end
+
   # The classes the extension resolved at init are pinned: after a
   # compaction that moves what it can, every path that builds or reads a
   # value still finds them.
