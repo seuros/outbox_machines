@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.0](https://github.com/seuros/outbox_machines/compare/outbox-machines-v0.5.0...outbox-machines-v0.6.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* private value fields, drop the enqueue sequence, Pass replaces the sweep flag, sealed exact-class values, clone-then-keep claim/fail/expire
+
+### Features
+
+* private value fields, drop the enqueue sequence, Pass replaces the sweep flag, sealed exact-class values, clone-then-keep claim/fail/expire ([e6c66dc](https://github.com/seuros/outbox_machines/commit/e6c66dcb726d2a211785504a9fff6ad1daa19611))
+
 ## [0.5.0](https://github.com/seuros/outbox_machines/compare/outbox-machines-v0.4.0...outbox-machines-v0.5.0) (2026-11-13)
 
 
