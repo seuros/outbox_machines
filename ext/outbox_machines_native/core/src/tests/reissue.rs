@@ -50,14 +50,11 @@ fn a_late_fail_from_a_dead_life_cannot_fail_the_new_one() {
     assert_eq!(outbox.forget(7), Ok(Forgetting::Forgotten));
     assert_eq!(outbox.enqueue(7, at(0)), Ok(Enqueue::Enqueued));
     let fresh = claim(&mut outbox, 0, 10);
-    let before = outbox.clone();
     // The same report again, word for word, is about a record that is gone.
-    assert_eq!(
-        outbox.fail(7, old.attempt(), at(0), at(4)),
-        Err(Refusal::Stale)
-    );
-    assert_eq!(outbox.confirm(7, old.attempt()), Err(Refusal::Stale));
-    assert_eq!(outbox, before);
+    refuses(&mut outbox, Refusal::Stale, |o| {
+        o.fail(7, old.attempt(), at(0), at(4))
+    });
+    refuses(&mut outbox, Refusal::Stale, |o| o.confirm(7, old.attempt()));
     assert_eq!(
         outbox.fail(7, fresh.attempt(), at(0), at(4)),
         Ok(Failure::Failed(Disposition::Dead))
@@ -101,14 +98,15 @@ fn a_repeat_is_honoured_only_for_the_attempt_that_produced_the_outcome() {
     assert_eq!(outbox.get(7).map(|e| e.attempts()), Some(1));
     assert_eq!(outbox.get(8).map(|e| e.attempts()), Some(1));
 
-    let before = outbox.clone();
     assert_eq!(
-        outbox.confirm(7, new7.attempt()),
+        unchanged(&mut outbox, |o| o.confirm(7, new7.attempt())),
         Ok(Confirmation::AlreadyConfirmed)
     );
-    assert_eq!(outbox.confirm(7, old7.attempt()), Err(Refusal::Stale));
+    refuses(&mut outbox, Refusal::Stale, |o| {
+        o.confirm(7, old7.attempt())
+    });
     assert_eq!(
-        outbox.fail(8, new8.attempt(), at(0), at(0)),
+        unchanged(&mut outbox, |o| o.fail(8, new8.attempt(), at(0), at(0))),
         Ok(Failure::AlreadyFailed(retry))
     );
     for old in [
@@ -117,9 +115,10 @@ fn a_repeat_is_honoured_only_for_the_attempt_that_produced_the_outcome() {
         old7.attempt(),
         new7.attempt(),
     ] {
-        assert_eq!(outbox.fail(8, old, at(0), at(0)), Err(Refusal::Stale));
+        refuses(&mut outbox, Refusal::Stale, |o| {
+            o.fail(8, old, at(0), at(0))
+        });
     }
-    assert_eq!(outbox, before);
 }
 
 /// Fail the claim for immediate retry and claim the record again.

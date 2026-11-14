@@ -1,7 +1,7 @@
 use super::*;
 use core::assert_matches;
 use core::num::NonZeroU32;
-use matryona_machines::testing::refuses;
+use matryona_machines::testing::{refuses, unchanged};
 use std::vec::Vec;
 
 fn at(ms: u64) -> Duration {

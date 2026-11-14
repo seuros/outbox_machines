@@ -246,6 +246,19 @@ class OutboxTest < Minitest::Test
     assert_equal 64, box.capacity
   end
 
+  # Frozen is checked before any argument is read: a frozen outbox handed a
+  # malformed argument raises FrozenError, as Ruby's own core methods do.
+  def test_frozen_is_checked_before_the_arguments
+    box = outbox
+    box.freeze
+    assert_raises(FrozenError) { box.enqueue(1.5, 0) }
+    assert_raises(FrozenError) { box.claim(nil, 1) }
+    assert_raises(FrozenError) { box.expire_claims(0, -1) }
+    assert_raises(FrozenError) { box.confirm('1', 1) }
+    assert_raises(FrozenError) { box.fail(1, 1, 0, 2**64) }
+    assert_raises(FrozenError) { box.forget(:id) }
+  end
+
   def test_gc_stress
     previous = GC.stress
     GC.stress = true

@@ -6,7 +6,7 @@ mod values;
 use std::{cell::RefCell, num::NonZeroU32};
 
 use magnus::{Error, RClass, Ruby, Symbol, Value, prelude::*, typed_data::Obj};
-use matryona_machines::ruby::{duration, integer, keep, nanoseconds, symbol};
+use matryona_machines::ruby::{Symbols, duration, integer, keep, nanoseconds, positive, symbol};
 
 use crate::classes::classes;
 use outbox_machines::{
@@ -44,22 +44,26 @@ fn answer(ruby: &Ruby, outcome: Result<&str, Refusal>) -> Value {
     }
 }
 
+matryona_machines::symbols! {
+    /// The core's refusals as Symbols: the snake case of each variant.
+    Refusals for Refusal as "a refusal" {
+        Unknown => "unknown",
+        Stale => "stale",
+        NotTerminal => "not_terminal",
+        TimeRegression => "time_regression",
+        InvalidDuration => "invalid_duration",
+        Full => "full",
+        Exhausted => "exhausted",
+        Mismatch => "mismatch",
+    }
+}
+
 fn refusal(ruby: &Ruby, refusal: Refusal) -> Value {
-    let name = match refusal {
-        Refusal::Unknown => "unknown",
-        Refusal::Stale => "stale",
-        Refusal::NotTerminal => "not_terminal",
-        Refusal::TimeRegression => "time_regression",
-        Refusal::InvalidDuration => "invalid_duration",
-        Refusal::Full => "full",
-        Refusal::Exhausted => "exhausted",
-        Refusal::Mismatch => "mismatch",
-    };
-    symbol(ruby, name).as_value()
+    Refusals::symbol(ruby, refusal).as_value()
 }
 
 fn state_symbol(ruby: &Ruby, state: State) -> Symbol {
-    symbol(ruby, values::state_name(state))
+    values::States::symbol(ruby, state)
 }
 
 /// `retry` is the `Retry` class, resolved at init.
@@ -73,11 +77,11 @@ fn disposition(ruby: &Ruby, retry: RClass, value: Disposition) -> Result<Value, 
 // Refusals are answers (symbols), not exceptions. Only malformed input raises.
 impl Outbox {
     fn new(ruby: &Ruby, max_attempts: Value) -> Result<Self, Error> {
-        Self::build(ruby, Self::max(ruby, max_attempts)?, 0, 0)
+        Self::build(ruby, Self::max(max_attempts)?, 0, 0)
     }
 
     fn with_scope(ruby: &Ruby, max_attempts: Value, scope: Value) -> Result<Self, Error> {
-        let max = Self::max(ruby, max_attempts)?;
+        let max = Self::max(max_attempts)?;
         Self::build(ruby, max, integer(scope, "scope")?, 0)
     }
 
@@ -87,14 +91,13 @@ impl Outbox {
         scope: Value,
         issued: Value,
     ) -> Result<Self, Error> {
-        let max = Self::max(ruby, max_attempts)?;
+        let max = Self::max(max_attempts)?;
         let scope = integer(scope, "scope")?;
         Self::build(ruby, max, scope, integer(issued, "issued")?)
     }
 
-    fn max(ruby: &Ruby, max_attempts: Value) -> Result<NonZeroU32, Error> {
-        NonZeroU32::new(integer(max_attempts, "max_attempts")?)
-            .ok_or_else(|| range(ruby, "max_attempts must be in 1..=4294967295"))
+    fn max(max_attempts: Value) -> Result<NonZeroU32, Error> {
+        positive(max_attempts, "max_attempts")
     }
 
     /// The core answers `None` for a count past the sequence; that is
@@ -131,8 +134,8 @@ impl Outbox {
     }
 
     fn enqueue(ruby: &Ruby, this: Obj<Self>, id: Value, now: Value) -> Result<Value, Error> {
-        let (id, now) = (integer(id, "id")?, duration(now, "now")?);
         this.check_frozen()?;
+        let (id, now) = (integer(id, "id")?, duration(now, "now")?);
         let outcome = this.core.borrow_mut().enqueue(id, now);
         Ok(answer(
             ruby,
@@ -145,6 +148,7 @@ impl Outbox {
 
     /// A `Claimed`, `nil` when nothing is due, or a refusal symbol.
     fn claim(ruby: &Ruby, this: Obj<Self>, now: Value, lease: Value) -> Result<Value, Error> {
+        this.check_frozen()?;
         let (now, lease) = (duration(now, "now")?, duration(lease, "lease")?);
         let class = classes(ruby)?.claimed.get(ruby);
         keep(
@@ -164,8 +168,8 @@ impl Outbox {
     }
 
     fn confirm(ruby: &Ruby, this: Obj<Self>, id: Value, attempt: Value) -> Result<Value, Error> {
-        let (id, attempt) = (integer(id, "id")?, integer(attempt, "attempt")?);
         this.check_frozen()?;
+        let (id, attempt) = (integer(id, "id")?, integer(attempt, "attempt")?);
         let outcome = this.core.borrow_mut().confirm(id, attempt);
         Ok(answer(
             ruby,
@@ -184,6 +188,7 @@ impl Outbox {
         now: Value,
         retry_after: Value,
     ) -> Result<Value, Error> {
+        this.check_frozen()?;
         let (id, attempt) = (integer(id, "id")?, integer(attempt, "attempt")?);
         let (now, after) = (duration(now, "now")?, duration(retry_after, "retry_after")?);
         let classes = classes(ruby)?;
@@ -214,6 +219,7 @@ impl Outbox {
         now: Value,
         max_scan: Value,
     ) -> Result<Value, Error> {
+        this.check_frozen()?;
         let (now, scan) = (duration(now, "now")?, integer(max_scan, "max_scan")?);
         let classes = classes(ruby)?;
         let (retry, expired_class) = (classes.retry.get(ruby), classes.expired.get(ruby));
@@ -239,7 +245,7 @@ impl Outbox {
                     expired.push(expired_class.funcall::<_, _, Value>("new", fields)?)?;
                 }
                 expired.freeze();
-                let pass = symbol(ruby, values::pass_name(sweep.pass()));
+                let pass = values::Passes::symbol(ruby, sweep.pass());
                 classes
                     .sweep
                     .get(ruby)
@@ -249,8 +255,8 @@ impl Outbox {
     }
 
     fn forget(ruby: &Ruby, this: Obj<Self>, id: Value) -> Result<Value, Error> {
-        let id = integer(id, "id")?;
         this.check_frozen()?;
+        let id = integer(id, "id")?;
         let outcome = this.core.borrow_mut().forget(id);
         Ok(answer(
             ruby,
@@ -281,7 +287,7 @@ impl Outbox {
     }
 
     fn count(ruby: &Ruby, this: Obj<Self>, state: Value) -> Result<usize, Error> {
-        let state = values::state(ruby, state)?;
+        let state = values::States::parse(ruby, state)?;
         Ok(this.core.borrow().count(state))
     }
 }

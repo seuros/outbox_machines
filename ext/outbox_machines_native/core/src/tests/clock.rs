@@ -20,9 +20,10 @@ fn a_full_enqueue_changes_nothing() {
 fn a_duplicate_enqueue_changes_nothing() {
     let mut outbox = Outbox::<2>::new(max(2));
     assert_eq!(outbox.enqueue(1, at(10)), Ok(Enqueue::Enqueued));
-    let before = outbox.clone();
-    assert_eq!(outbox.enqueue(1, at(500)), Ok(Enqueue::Duplicate));
-    assert_eq!(outbox, before);
+    assert_eq!(
+        unchanged(&mut outbox, |o| o.enqueue(1, at(500))),
+        Ok(Enqueue::Duplicate)
+    );
     assert_eq!(outbox.get(1).map(|e| e.available_at()), Some(at(10)));
     assert_eq!(outbox.enqueue(2, at(10)), Ok(Enqueue::Enqueued));
     // Backwards time is refused before the repeat is recognised.

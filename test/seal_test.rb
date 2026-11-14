@@ -63,6 +63,24 @@ class SealTest < Minitest::Test
     assert_equal 1, Sweep.new([reaped].tap(&:singleton_class).freeze, 1, :partial).expired.size
   end
 
+  # The extension reads every value's fields from the struct, never through
+  # its readers: a redefined reader is ignored, and cannot re-enter.
+  def test_a_redefined_reader_is_ignored
+    retry_at = Retry.new(5)
+    reaped = Expired.new(1, 1, Retry.new(3))
+    readers = { Retry => %i[at], Expired => %i[id attempt disposition] }
+    originals = readers.flat_map { |klass, names| names.map { [klass, it, klass.instance_method(it)] } }
+    begin
+      originals.each { |klass, name, _| klass.define_method(name) { raise "#{name} reader ran" } }
+      failed = Failed.new(retry_at)
+      sweep = Sweep.new([reaped].freeze, 1, :partial)
+    ensure
+      originals.each { |klass, name, reader| klass.define_method(name, reader) }
+    end
+    assert_equal 5, failed.disposition.at
+    assert_equal [reaped], sweep.expired
+  end
+
   # The classes the extension resolved at init are pinned: after a
   # compaction that moves what it can, every path that builds or reads a
   # value still finds them.
