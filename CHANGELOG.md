@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/seuros/outbox_machines/compare/outbox_machines/v0.6.0...outbox_machines/v0.6.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* **deps:** require matryona-machines &gt;= 0.3 ([8f99e68](https://github.com/seuros/outbox_machines/commit/8f99e681d265f29452b81a86ec67adcf4b309931))
+
 ## [0.6.0](https://github.com/seuros/outbox_machines/compare/outbox_machines/v0.5.0...outbox_machines/v0.6.0) (2026-11-14)
 
 
