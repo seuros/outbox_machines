@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/seuros/outbox_machines/compare/outbox_machines/v0.6.1...outbox_machines/v0.7.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* read dispositions with symbol_or_fields under one message
+
+### Features
+
+* read dispositions with symbol_or_fields under one message ([e688077](https://github.com/seuros/outbox_machines/commit/e688077d680a0141eb8e637bc3043cd2b58b4486))
+
 ## [0.6.1](https://github.com/seuros/outbox_machines/compare/outbox_machines/v0.6.0...outbox_machines/v0.6.1) (2026-11-14)
 
 
