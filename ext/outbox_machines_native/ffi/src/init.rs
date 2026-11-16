@@ -1,6 +1,7 @@
 //! Private native entry point.
 use crate::{CAPACITY, Outbox, scope_of};
 use magnus::{Error, Ruby, function, method, prelude::*};
+use matryona_machines::ruby::Class;
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
@@ -28,5 +29,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("forget", method!(Outbox::forget, 1))?;
     class.define_method("get", method!(Outbox::get, 1))?;
     class.define_method("count", method!(Outbox::count, 1))?;
-    Ok(())
+    // `new`, `with_scope` and `resumed` answer an Outbox: its class is fixed
+    // now, so no conversion runs `Object.const_get` later.
+    Class::pin_wrapped::<Outbox>(ruby, class).map(drop)
 }
