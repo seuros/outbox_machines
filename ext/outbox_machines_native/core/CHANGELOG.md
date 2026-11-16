@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.9.0](https://github.com/seuros/outbox_machines/compare/outbox-machines-v0.8.0...outbox-machines-v0.9.0) (2026-11-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* rename Sweep::written to Sweep::expired; times take full Duration
+
+### Features
+
+* rename Sweep::written to Sweep::expired; times take full Duration ([6ed9a94](https://github.com/seuros/outbox_machines/commit/6ed9a94383a1f48efcbd0074900b2d79c717d425))
+
 ## [0.8.0](https://github.com/seuros/outbox_machines/compare/outbox-machines-v0.7.0...outbox-machines-v0.8.0) (2026-11-14)
 
 
