@@ -64,7 +64,7 @@ fn honoured_calls_record_the_instant_even_when_nothing_is_due() {
     assert_eq!(outbox.enqueue(1, at(19)), Err(Refusal::TimeRegression));
     let mut out = [Expired::default(); 1];
     let sweep = outbox.expire_claims(at(30), 0, &mut out);
-    assert_eq!(sweep.map(|s| (s.written(), s.scanned())), Ok((0, 0)));
+    assert_eq!(sweep.map(|s| (s.expired(), s.scanned())), Ok((0, 0)));
     assert_eq!(outbox.enqueue(1, at(29)), Err(Refusal::TimeRegression));
     assert_eq!(outbox.enqueue(1, at(30)), Ok(Enqueue::Enqueued));
     let c = claim(&mut outbox, 30, 5);

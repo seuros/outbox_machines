@@ -108,7 +108,7 @@ fn a_reaped_attempt_was_not_failed() {
     let retried = claim(&mut outbox, 0, 5);
     let mut out = [Expired::default(); 2];
     let sweep = outbox.expire_claims(at(5), 2, &mut out);
-    assert_eq!(sweep.map(|s| s.written()), Ok(1));
+    assert_eq!(sweep.map(|s| s.expired()), Ok(1));
     assert_eq!(out[0].disposition(), Disposition::Dead);
     // Never claimed: attempt 0 names no attempt.
     refuses(&mut outbox, Refusal::Stale, |o| o.fail(2, 0, at(5), at(0)));

@@ -23,9 +23,11 @@ class ValuesTest < Minitest::Test
       assert_equal :dead, failure.new(:dead).disposition
       assert_equal Retry.new(5), failure.new(disposition: Retry.new(5)).disposition
       %i[nope retry].each do |bad|
-        assert_equal 'disposition must be a Retry or :dead', assert_raises(RangeError) { failure.new(bad) }.message
+        assert_equal "unknown disposition #{bad.inspect}", assert_raises(RangeError) { failure.new(bad) }.message
       end
-      [nil, 5, 'dead', Object.new, Claimed.new(1, 1, 1)].each { |bad| assert_raises(TypeError) { failure.new(bad) } }
+      [nil, 5, 'dead', Object.new, Claimed.new(1, 1, 1)].each do |bad|
+        assert_equal 'disposition must be a Retry or :dead', assert_raises(TypeError) { failure.new(bad) }.message
+      end
     end
   end
 

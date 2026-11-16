@@ -1,4 +1,5 @@
 #![no_std]
+#![cfg_attr(not(test), deny(clippy::indexing_slicing))]
 #![doc = include_str!("../README.md")]
 
 mod refusal;
@@ -73,11 +74,10 @@ struct Record {
     seq: usize,
     state: State,
     attempts: u32,
-    /// Identity of the latest attempt; 0, which is never issued, until the
-    /// record is first claimed.
-    attempt: u64,
+    /// The latest attempt and its lease; `None` until the record is first
+    /// claimed.
+    latest: Option<Lease>,
     available_at: Duration,
-    lease_expires: Duration,
     /// The `retry_after` of the `fail` that ended the latest attempt; `None`
     /// when it is live, confirmed, or was reaped by `expire_claims`. It is
     /// what lets a repeated `fail` be told from a report on an attempt whose
@@ -85,12 +85,18 @@ struct Record {
     failed: Option<Duration>,
 }
 
+/// One issued attempt: its identity and the instant its lease ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Lease {
+    attempt: u64,
+    expires: Duration,
+}
+
 impl Record {
     const fn view(&self) -> Entry {
-        let attempt = if self.attempt == 0 {
-            None
-        } else {
-            Some(self.attempt)
+        let attempt = match self.latest {
+            Some(lease) => Some(lease.attempt),
+            None => None,
         };
         Entry::held(
             self.id,
@@ -99,6 +105,11 @@ impl Record {
             attempt,
             self.available_at,
         )
+    }
+
+    /// `true` when `attempt` is this record's latest one.
+    fn is_latest(&self, attempt: u64) -> bool {
+        self.latest.is_some_and(|lease| lease.attempt == attempt)
     }
 }
 
@@ -265,9 +276,8 @@ impl<const N: usize> Outbox<N> {
             seq,
             state: State::Pending,
             attempts: 0,
-            attempt: 0,
+            latest: None,
             available_at: now,
-            lease_expires: Duration::ZERO,
             failed: None,
         });
         Ok(Enqueue::Enqueued)
@@ -311,9 +321,11 @@ impl<const N: usize> Outbox<N> {
         };
         self.observed = now;
         record.attempts = record.attempts.saturating_add(1);
-        record.attempt = attempt;
+        record.latest = Some(Lease {
+            attempt,
+            expires: lease_expires,
+        });
         record.state = State::Claimed;
-        record.lease_expires = lease_expires;
         record.failed = None;
         Ok(Some(Claimed::issued(record.id, attempt, lease_expires)))
     }
@@ -339,7 +351,7 @@ impl<const N: usize> Outbox<N> {
             .flatten()
             .find(|record| record.id == id)
             .ok_or(Refusal::Unknown)?;
-        if record.attempt == attempt {
+        if record.is_latest(attempt) {
             Ok(record)
         } else {
             Err(Refusal::Stale)
@@ -457,7 +469,7 @@ impl<const N: usize> Outbox<N> {
     /// stops *before* the next due claim, so nothing is lost; call again.
     /// Expired claims retry immediately (or die at `max_attempts`).
     ///
-    /// The first [`Sweep::written`] entries of `out` are written; the rest are
+    /// The first [`Sweep::expired`] entries of `out` are written; the rest are
     /// left untouched. Build the buffer as `[Expired::default(); K]`.
     ///
     /// # Errors
@@ -471,21 +483,25 @@ impl<const N: usize> Outbox<N> {
         self.check_time(now)?;
         self.observed = now;
         let max = self.max_attempts.get();
-        let (mut written, mut scanned) = (0, 0);
+        let (mut expired, mut scanned) = (0, 0);
         while scanned < max_scan && self.scanned_in_pass < N {
             // `cursor < N` always; an empty slot and that impossible miss
-            // alike hold nothing to reap.
+            // alike hold nothing to reap. A claimed record always carries its
+            // lease, so matching on it skips no claim.
             if let Some(Some(record)) = self.slots.get_mut(self.cursor)
                 && record.state == State::Claimed
-                && record.lease_expires <= now
+                && let Some(lease) = record.latest
+                && lease.expires <= now
             {
-                let Some(entry) = out.get_mut(written) else {
+                let Some(entry) = out.get_mut(expired) else {
                     break;
                 };
                 let disposition = Self::settle(record, max, now);
-                *entry = Expired::reaped(record.id, record.attempt, disposition);
-                written += 1;
+                *entry = Expired::reaped(record.id, lease.attempt, disposition);
+                expired += 1;
             }
+            // Each counter is below its loop bound, and the loop only runs
+            // when N > 0, so neither the steps nor `% N` can fault.
             scanned += 1;
             self.scanned_in_pass += 1;
             self.cursor = (self.cursor + 1) % N;
@@ -499,7 +515,7 @@ impl<const N: usize> Outbox<N> {
         } else {
             Pass::Partial
         };
-        Ok(Sweep::swept(written, scanned, pass))
+        Ok(Sweep::swept(expired, scanned, pass))
     }
 
     /// Drop a confirmed or dead record, freeing its slot and its id.

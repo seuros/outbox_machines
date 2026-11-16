@@ -2,6 +2,7 @@
 
 require 'minitest/autorun'
 require 'outbox_machines'
+require_relative 'support'
 
 # The binding never loses work. `claim`, `fail` and `expire_claims` answer
 # Ruby objects, so the core decides on a copy, the answer is built, and the
@@ -9,6 +10,7 @@ require 'outbox_machines'
 # that raises, calls back in, or freezes the outbox applies nothing.
 class WorkTest < Minitest::Test
   include OutboxMachines
+  include Redefining
 
   # Each mutating call that builds values: the outbox it runs on, the call,
   # and every class whose `new` it runs.
@@ -28,12 +30,10 @@ class WorkTest < Minitest::Test
 
   # Runs the block with `klass.new` replaced by `body`, the way reopening the
   # class could redefine it; the real `new` is `klass.__real_new`.
-  def replacing_new(klass, body)
+  def replacing_new(klass, body, &)
     klass.singleton_class.alias_method(:__real_new, :new)
-    klass.define_singleton_method(:new, &body)
-    yield
+    redefining(klass.singleton_class, new: body, &)
   ensure
-    klass.singleton_class.alias_method(:new, :__real_new)
     klass.singleton_class.remove_method(:__real_new)
   end
 

@@ -6,9 +6,13 @@ Gem::Specification.new do |spec|
   spec.version = OutboxMachines::VERSION
   spec.authors = ['Abdelkader Boudih']
   spec.email = ['oss@seuros.com']
-  spec.summary = 'Initial bounded outbox delivery policy with a native Rust core'
-  spec.description = 'Unstable in-memory delivery metadata (pending, claimed, confirmed, dead); ' \
-                     'not a transactional outbox or retry engine.'
+  spec.summary = 'Delivery ledger for an outbox: claims, leases and attempt identities for Ruby'
+  spec.description = 'Tracks every message owed to the outside world as pending, claimed by one ' \
+                     'attempt, confirmed or dead. Each claim carries an attempt identity issued once ' \
+                     'and never again, so a late worker cannot settle an attempt handed to someone ' \
+                     'else, and a lease that runs out is reported as an unknown outcome, not a ' \
+                     'failure. Bound to Ruby from the no_std outbox-machines crate: the delivery ' \
+                     'policy only, not a transactional outbox, a queue or a retry engine.'
   spec.homepage = 'https://github.com/seuros/outbox_machines'
   spec.license = 'MIT'
   spec.required_ruby_version = '>= 4.0.0'

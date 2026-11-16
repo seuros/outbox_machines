@@ -129,7 +129,7 @@ fn scope_zero_issues_the_plain_counter() {
     );
     let mut out = [Expired::default(); 1];
     let sweep = scoped_box.expire_claims(at(5), 2, &mut out);
-    assert_eq!(sweep.map(|s| s.written()), Ok(1));
+    assert_eq!(sweep.map(|s| s.expired()), Ok(1));
     assert_eq!((out[0].attempt(), out[0].scope()), (scoped(9, 1), 9));
     // The plain counter of scope zero is foreign to it.
     assert_eq!(scoped_box.confirm(1, 1), Err(Refusal::Stale));

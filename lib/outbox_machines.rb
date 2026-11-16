@@ -22,7 +22,7 @@ module OutboxMachines
     end
 
     # The scope of the outbox that issued this attempt.
-    def scope = Outbox.__send__(:__scope_of, attempt)
+    def scope = Outbox.__send__(:__scope_of, self)
   end
 
   # The core's `Disposition::Retry(at)`: the record is pending again and
@@ -72,7 +72,7 @@ module OutboxMachines
     end
 
     # The scope of the outbox that issued the reaped attempt.
-    def scope = Outbox.__send__(:__scope_of, attempt)
+    def scope = Outbox.__send__(:__scope_of, self)
   end
 
   # Progress of one bounded `expire_claims` call: the Expired values it reaped,

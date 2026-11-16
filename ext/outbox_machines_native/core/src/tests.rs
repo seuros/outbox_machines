@@ -39,7 +39,7 @@ fn reap<const N: usize, const K: usize>(
 ) -> (Sweep, Vec<Expired>) {
     let mut out = [Expired::default(); K];
     match outbox.expire_claims(at(now), max_scan, &mut out) {
-        Ok(sweep) => (sweep, out[..sweep.written()].to_vec()),
+        Ok(sweep) => (sweep, out[..sweep.expired()].to_vec()),
         Err(refusal) => panic!("expected a sweep, got {refusal:?}"),
     }
 }
@@ -145,7 +145,7 @@ fn stale_attempts_cannot_touch_a_newer_attempt() {
     let mut outbox = Outbox::<1>::new(max(5));
     assert_eq!(outbox.enqueue(1, at(0)), Ok(Enqueue::Enqueued));
     let old = claim(&mut outbox, 0, 10);
-    assert_eq!(reap::<1, 1>(&mut outbox, 10, 8).0.written(), 1);
+    assert_eq!(reap::<1, 1>(&mut outbox, 10, 8).0.expired(), 1);
     let fresh = claim(&mut outbox, 10, 10);
     assert_eq!(fresh.attempt(), 2);
     assert_eq!(outbox.confirm(1, old.attempt()), Err(Refusal::Stale));
@@ -290,7 +290,7 @@ fn a_default_buffer_is_filled_from_the_front() {
     let lost = claim(&mut outbox, 0, 5);
     let mut out = [Expired::default(); 3];
     let sweep = outbox.expire_claims(at(5), 2, &mut out);
-    assert_matches!(sweep, Ok(s) if s.written() == 1);
+    assert_matches!(sweep, Ok(s) if s.expired() == 1);
     let reaped = Expired::new(lost.id(), lost.attempt(), Disposition::Dead);
     assert_eq!(Some(out[0]), reaped);
     assert_eq!(out[1..], [Expired::default(); 2]);

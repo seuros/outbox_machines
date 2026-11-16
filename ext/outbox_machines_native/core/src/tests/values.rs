@@ -34,12 +34,12 @@ fn an_expired_needs_an_issuable_attempt() {
 fn a_sweep_writes_no_more_than_it_scanned() {
     let sweep = Sweep::new(2, 3, Pass::Partial);
     assert_eq!(
-        sweep.map(|s| (s.written(), s.scanned(), s.pass())),
+        sweep.map(|s| (s.expired(), s.scanned(), s.pass())),
         Some((2, 3, Pass::Partial))
     );
-    for (written, scanned, valid) in [(0, 0, true), (3, 3, true), (4, 3, false)] {
+    for (expired, scanned, valid) in [(0, 0, true), (3, 3, true), (4, 3, false)] {
         assert_eq!(
-            Sweep::new(written, scanned, Pass::Complete).is_some(),
+            Sweep::new(expired, scanned, Pass::Complete).is_some(),
             valid
         );
     }

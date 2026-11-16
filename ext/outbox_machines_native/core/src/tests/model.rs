@@ -403,12 +403,12 @@ fn sweep(outbox: &mut Outbox<5>, model: &mut Model, now: u64) {
         let Ok(sweep) = sweep else {
             panic!("time is monotonic")
         };
-        let rebuilt = Sweep::new(sweep.written(), sweep.scanned(), sweep.pass());
+        let rebuilt = Sweep::new(sweep.expired(), sweep.scanned(), sweep.pass());
         assert_eq!(rebuilt, Some(sweep));
-        for e in &out[..sweep.written()] {
+        for e in &out[..sweep.expired()] {
             assert_eq!(Expired::new(e.id(), e.attempt(), e.disposition()), Some(*e));
         }
-        reaped.extend(out[..sweep.written()].iter().map(|e| (e.id(), e.attempt())));
+        reaped.extend(out[..sweep.expired()].iter().map(|e| (e.id(), e.attempt())));
         if sweep.pass() == Pass::Complete {
             break;
         }

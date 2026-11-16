@@ -13,6 +13,7 @@ class OutboxTest < Minitest::Test
   Entry = OutboxMachines::Entry
   Failed = OutboxMachines::Failed
   AlreadyFailed = OutboxMachines::AlreadyFailed
+  DURATION_MAX = (((2**64) - 1) * 1_000_000_000) + 999_999_999
 
   def test_values_mirror_the_core
     [Claimed, Expired, Sweep, Retry, Entry, Failed, AlreadyFailed].each { assert_operator _1, :<, Data }
@@ -58,6 +59,25 @@ class OutboxTest < Minitest::Test
     assert_equal 2 * top, claimed.lease_expires
     assert_equal Failed.new(Retry.new(2 * top)), box.fail(1, claimed.attempt, top, top)
     assert_nil box.claim(top, 1)
+  end
+
+  # Every instant the outbox answers reads back as an argument: a lease end
+  # past u64 is a `now` like any other, and the time arguments take the whole
+  # Duration range the Data values take.
+  def test_time_arguments_take_the_whole_duration_range
+    top = 2**64 - 1
+    box = outbox
+    box.enqueue(1, 0)
+    claimed = box.claim(top, top)
+    reaped = Expired.new(1, claimed.attempt, Retry.new(claimed.lease_expires))
+    assert_equal Sweep.new([reaped], 64, :complete), box.expire_claims(claimed.lease_expires, 64)
+    again = box.claim(claimed.lease_expires, 1)
+    assert_equal claimed.lease_expires + 1, again.lease_expires
+    assert_equal :invalid_duration, box.fail(1, again.attempt, claimed.lease_expires, DURATION_MAX)
+    assert_equal :invalid_duration, box.claim(claimed.lease_expires, DURATION_MAX)
+    assert_equal :duplicate, box.enqueue(1, DURATION_MAX)
+    box.enqueue(2, DURATION_MAX)
+    assert_equal :invalid_duration, box.claim(DURATION_MAX, 1)
   end
 
   def test_get_answers_an_entry
@@ -227,7 +247,7 @@ class OutboxTest < Minitest::Test
     ]
     calls.each do |call|
       [1.0, 1r, nil, '1', Time.now].each { |bad| assert_raises(TypeError) { call.(bad) } }
-      [-1, 2**64].each { |bad| assert_raises(RangeError) { call.(bad) } }
+      [-1, DURATION_MAX + 1].each { |bad| assert_raises(RangeError) { call.(bad) } }
     end
     assert_equal 0, box.size
   end
@@ -255,7 +275,7 @@ class OutboxTest < Minitest::Test
     assert_raises(FrozenError) { box.claim(nil, 1) }
     assert_raises(FrozenError) { box.expire_claims(0, -1) }
     assert_raises(FrozenError) { box.confirm('1', 1) }
-    assert_raises(FrozenError) { box.fail(1, 1, 0, 2**64) }
+    assert_raises(FrozenError) { box.fail(1, 1, 0, DURATION_MAX + 1) }
     assert_raises(FrozenError) { box.forget(:id) }
   end
 

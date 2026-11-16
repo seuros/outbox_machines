@@ -7,7 +7,7 @@ use std::{cell::RefCell, num::NonZeroU32};
 
 use magnus::{Error, RClass, Ruby, Symbol, Value, prelude::*, typed_data::Obj};
 use matryona_machines::ruby::{
-    SymbolNames, Symbols, duration, integer, keep, nanoseconds, positive, symbol,
+    SymbolNames, Symbols, instant, integer, keep, nanoseconds, positive, symbol, which_fields,
 };
 
 use crate::classes::classes;
@@ -25,9 +25,14 @@ fn range(ruby: &Ruby, message: &'static str) -> Error {
 }
 
 /// The scope an attempt identity carries: `Claimed#scope`, `Expired#scope`.
-/// Those values hold only issuable attempts, so the `RangeError` is for a
-/// direct call with sequence zero.
-fn scope_of(ruby: &Ruby, attempt: Value) -> Result<u16, Error> {
+/// The value is read natively, exactly a `Claimed` or an `Expired` with its
+/// attempt from the struct, never through a reader, and checked again:
+/// `RangeError` for a sequence of zero, which `Marshal.load` can forge.
+fn scope_of(ruby: &Ruby, value: Value) -> Result<u16, Error> {
+    let classes = classes(ruby)?;
+    let held = [classes.claimed.get(ruby), classes.expired.get(ruby)];
+    let message = "expected an OutboxMachines::Claimed or an OutboxMachines::Expired";
+    let (_, [_, attempt, _]) = which_fields::<3>(ruby, value, &held, message)?;
     Expired::new(0, integer(attempt, "attempt")?, Disposition::Dead)
         .map(|expired| expired.scope())
         .ok_or_else(|| range(ruby, "attempt must have a sequence of at least 1"))
@@ -137,7 +142,7 @@ impl Outbox {
 
     fn enqueue(ruby: &Ruby, this: Obj<Self>, id: Value, now: Value) -> Result<Value, Error> {
         this.check_frozen()?;
-        let (id, now) = (integer(id, "id")?, duration(now, "now")?);
+        let (id, now) = (integer(id, "id")?, instant(now, "now")?);
         let outcome = this.core.borrow_mut().enqueue(id, now);
         Ok(answer(
             ruby,
@@ -151,7 +156,7 @@ impl Outbox {
     /// A `Claimed`, `nil` when nothing is due, or a refusal symbol.
     fn claim(ruby: &Ruby, this: Obj<Self>, now: Value, lease: Value) -> Result<Value, Error> {
         this.check_frozen()?;
-        let (now, lease) = (duration(now, "now")?, duration(lease, "lease")?);
+        let (now, lease) = (instant(now, "now")?, instant(lease, "lease")?);
         let class = classes(ruby)?.claimed.get(ruby);
         keep(
             ruby,
@@ -192,7 +197,7 @@ impl Outbox {
     ) -> Result<Value, Error> {
         this.check_frozen()?;
         let (id, attempt) = (integer(id, "id")?, integer(attempt, "attempt")?);
-        let (now, after) = (duration(now, "now")?, duration(retry_after, "retry_after")?);
+        let (now, after) = (instant(now, "now")?, instant(retry_after, "retry_after")?);
         let classes = classes(ruby)?;
         keep(
             ruby,
@@ -222,7 +227,7 @@ impl Outbox {
         max_scan: Value,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let (now, scan) = (duration(now, "now")?, integer(max_scan, "max_scan")?);
+        let (now, scan) = (instant(now, "now")?, integer(max_scan, "max_scan")?);
         let classes = classes(ruby)?;
         let (retry, expired_class) = (classes.retry.get(ruby), classes.expired.get(ruby));
         keep(
@@ -240,8 +245,8 @@ impl Outbox {
                     Ok(swept) => swept,
                     Err(e) => return Ok(refusal(ruby, e)),
                 };
-                let expired = ruby.ary_new_capa(sweep.written());
-                for entry in out.iter().take(sweep.written()) {
+                let expired = ruby.ary_new_capa(sweep.expired());
+                for entry in out.iter().take(sweep.expired()) {
                     let fate = disposition(ruby, retry, entry.disposition())?;
                     let fields = (entry.id(), entry.attempt(), fate);
                     expired.push(expired_class.funcall::<_, _, Value>("new", fields)?)?;

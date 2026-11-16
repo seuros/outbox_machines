@@ -2,12 +2,14 @@
 
 require 'minitest/autorun'
 require 'outbox_machines'
+require_relative 'support'
 
 # The values are sealed, and sealing stops accidents, not reflection: the
 # extension is the authority, and every value it reads back must be exactly
 # its class and valid by the core, whatever built it.
 class SealTest < Minitest::Test
   include OutboxMachines
+  include Redefining
 
   VALUES = [Claimed, Retry, Failed, AlreadyFailed, Expired, Sweep, Entry].freeze
 
@@ -71,14 +73,31 @@ class SealTest < Minitest::Test
     readers = { Retry => %i[at], Expired => %i[id attempt disposition] }
     originals = readers.flat_map { |klass, names| names.map { [klass, it, klass.instance_method(it)] } }
     begin
-      originals.each { |klass, name, _| klass.define_method(name) { raise "#{name} reader ran" } }
+      originals.each { |klass, name, _| replace_method(klass, name, proc { raise "#{name} reader ran" }) }
       failed = Failed.new(retry_at)
       sweep = Sweep.new([reaped].freeze, 1, :partial)
     ensure
-      originals.each { |klass, name, reader| klass.define_method(name, reader) }
+      originals.each { |klass, name, reader| replace_method(klass, name, (reader if reader.owner == klass)) }
     end
     assert_equal 5, failed.disposition.at
     assert_equal [reaped], sweep.expired
+  end
+
+  # `scope` reads its value natively: a redefined reader is never called,
+  # and an attempt `Marshal.load` rewrote to sequence zero is RangeError.
+  def test_scope_reads_the_value_natively
+    attempt = (3 << 48) | 1
+    values = [Claimed.new(1, attempt, 9), Expired.new(1, attempt, :dead)]
+    reader = proc { raise 'attempt reader ran' }
+    redefining(Claimed, attempt: reader) do
+      redefining(Expired, attempt: reader) { assert_equal [3, 3], values.map(&:scope) }
+    end
+    [Claimed.new(7, 1, 9), Expired.new(7, 1, :dead)].each do |value|
+      unissued = Marshal.load(Marshal.dump(value).sub("i\x06", "i\x00"))
+      assert_equal 0, unissued.attempt
+      assert_raises(RangeError) { unissued.scope }
+    end
+    assert_raises(TypeError) { Outbox.__send__(:__scope_of, Retry.new(1)) }
   end
 
   # The classes the extension resolved at init are pinned: after a

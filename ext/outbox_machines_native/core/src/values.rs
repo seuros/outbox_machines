@@ -164,36 +164,36 @@ pub enum Pass {
 /// Progress of one bounded [`Outbox::expire_claims`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sweep {
-    written: usize,
+    expired: usize,
     scanned: usize,
     pass: Pass,
 }
 
 impl Sweep {
-    /// A sweep report, or `None` when `written` exceeds `scanned`: every
+    /// A sweep report, or `None` when `expired` exceeds `scanned`: every
     /// entry written came from a slot the call examined.
     #[must_use]
-    pub const fn new(written: usize, scanned: usize, pass: Pass) -> Option<Self> {
-        if written <= scanned {
-            Some(Self::swept(written, scanned, pass))
+    pub const fn new(expired: usize, scanned: usize, pass: Pass) -> Option<Self> {
+        if expired <= scanned {
+            Some(Self::swept(expired, scanned, pass))
         } else {
             None
         }
     }
 
     /// The report of a sweep that wrote only entries it scanned.
-    pub(crate) const fn swept(written: usize, scanned: usize, pass: Pass) -> Self {
+    pub(crate) const fn swept(expired: usize, scanned: usize, pass: Pass) -> Self {
         Self {
-            written,
+            expired,
             scanned,
             pass,
         }
     }
 
-    /// Entries written to the caller's buffer.
+    /// Expired claims written to the front of the caller's buffer.
     #[must_use]
-    pub const fn written(&self) -> usize {
-        self.written
+    pub const fn expired(&self) -> usize {
+        self.expired
     }
 
     /// Slots examined by this call.

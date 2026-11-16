@@ -3,7 +3,8 @@
 //! answers `None` for raises `RangeError`.
 use magnus::{Error, Ruby, Value, prelude::*};
 use matryona_machines::ruby::{
-    Choice, Symbols, exact_array, exact_fields, instant, integer, optional, symbol_or_fields,
+    Choice, Refused, Symbols, exact_array, exact_fields, instant, integer, optional,
+    symbol_or_fields_why,
 };
 use outbox_machines::{Claimed, Disposition, Entry, Expired, Pass, State, Sweep};
 
@@ -40,10 +41,13 @@ matryona_machines::symbols! {
 /// A `Retry` or `:dead`, read back into the core's `Disposition`. A `Retry`
 /// must be exactly a `Retry`, and its instant is read and checked again.
 fn disposition(ruby: &Ruby, value: Value) -> Result<Disposition, Error> {
-    let message = "disposition must be a Retry or :dead";
     let retry = [classes(ruby)?.retry.get(ruby)];
+    let message = |why: Refused<'_>| match why {
+        Refused::UnknownSymbol(symbol) => format!("unknown disposition {}", symbol.inspect()),
+        _ => "disposition must be a Retry or :dead".into(),
+    };
     Ok(
-        match symbol_or_fields(ruby, value, Dispositions, &retry, message)? {
+        match symbol_or_fields_why(ruby, value, Dispositions, &retry, message)? {
             Choice::Symbol(disposition) => disposition,
             Choice::Struct(_, [at]) => Disposition::Retry(instant(at, "at")?),
         },

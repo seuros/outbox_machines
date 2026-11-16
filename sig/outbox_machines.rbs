@@ -1,13 +1,14 @@
 module OutboxMachines
   VERSION: String
 
-  # Private validating hooks behind the Data values.
-  def self.__retry: (untyped at) -> void
-  def self.__failure: (untyped disposition) -> void
-  def self.__claimed: (untyped id, untyped attempt, untyped lease_expires) -> void
-  def self.__expired: (untyped id, untyped attempt, untyped disposition) -> void
-  def self.__sweep: (untyped expired, untyped scanned, untyped pass) -> void
-  def self.__entry: (untyped id, untyped state, untyped attempts, untyped attempt, untyped available_at) -> void
+  # Private validating hooks behind the Data values: nil when the core has a
+  # value for the fields, TypeError/RangeError otherwise.
+  private def self.__retry: (Integer at) -> nil
+  private def self.__failure: (disposition disposition) -> nil
+  private def self.__claimed: (Integer id, Integer attempt, Integer lease_expires) -> nil
+  private def self.__expired: (Integer id, Integer attempt, disposition disposition) -> nil
+  private def self.__sweep: (Array[Expired] expired, Integer scanned, pass pass) -> nil
+  private def self.__entry: (Integer id, state state, Integer attempts, Integer? attempt, Integer available_at) -> nil
   CAPACITY: Integer
 
   type state = :pending | :claimed | :confirmed | :dead
@@ -112,8 +113,10 @@ module OutboxMachines
 
     # Every instant (`now`, `lease_expires`, a retry `at`) and every span
     # (`lease`, `retry_after`) is Integer nanoseconds of the caller's monotonic
-    # clock. A non-Integer raises TypeError; negative or past 2**64-1 raises
-    # RangeError.
+    # clock, over the whole `Duration` range, so every instant the outbox
+    # answers (a `lease_expires` past 2**64-1 included) reads back as `now`. A
+    # non-Integer raises TypeError; negative or past `Duration::MAX`
+    # nanoseconds raises RangeError. A sum past that is :invalid_duration.
 
     # An empty outbox in scope zero.
     def self.new: (Integer max_attempts) -> Outbox
@@ -132,9 +135,10 @@ module OutboxMachines
     # How many attempt identities this outbox has issued; also the sequence
     # number of the latest one. Save it to restart with Outbox.resumed.
     def issued: () -> Integer
-    # Private: what Claimed#scope and Expired#scope read. RangeError for an
-    # attempt of sequence zero.
-    def self.__scope_of: (Integer attempt) -> Integer
+    # Private: what Claimed#scope and Expired#scope read, from exactly a
+    # Claimed or an Expired (TypeError otherwise). RangeError for an attempt
+    # of sequence zero.
+    private def self.__scope_of: (Claimed | Expired held) -> Integer
     def capacity: () -> Integer
     def max_attempts: () -> Integer
     def size: () -> Integer

@@ -4,7 +4,7 @@
 
 Engine-room flight manual: track owed dispatches through identity-checked attempts.
 
-Initial, unstable. Bounded delivery-policy metadata for an outbox: records move
+Pre-1.0. Bounded delivery-policy metadata for an outbox: records move
 through `pending`, `claimed`, `confirmed` and `dead`, and every attempt carries
 an identity the outbox issues once and never again, so a stale worker cannot
 touch a newer attempt, nor a newer record that reuses the id.
@@ -23,8 +23,8 @@ backwards: every instant (`now`, `Claimed::lease_expires`, `Disposition::Retry`,
 `core::time::Duration` since an epoch the caller picks. The Ruby gem passes
 and answers the same values as Integer nanoseconds, and mirrors `Claimed`,
 `Expired`, `Sweep` and `Entry` as `Data` values of the same names, and
-`Failure`'s two variants as `Failed` and `AlreadyFailed` (its `Sweep` carries
-the expired entries where this one counts `written`). Lookup is a linear scan, so keep `N`
+`Failure`'s two variants as `Failed` and `AlreadyFailed` (its `Sweep#expired`
+carries the expired entries where this one's `Sweep::expired` counts them). Lookup is a linear scan, so keep `N`
 small. Ids are `u64`; payloads live outside.
 
 - `enqueue(id, now) -> Result<Enqueue, Refusal>`: `Enqueued`, or `Duplicate`
@@ -56,7 +56,7 @@ small. Ids are `u64`; payloads live outside.
 - `expire_claims(now, max_scan, out)`: reaps claims whose lease ended, into a
   caller buffer, with a persistent cursor. Bounded by `max_scan` and
   `out.len()`; call again until `Sweep::pass()` is `Pass::Complete`. Writes the first
-  `Sweep::written` entries of `out` and leaves the rest untouched. Build the
+  `Sweep::expired` entries of `out` and leaves the rest untouched. Build the
   buffer as `[Expired::default(); K]`: the default is a placeholder with
   attempt 0, which the outbox never emits. Refuses with `TimeRegression`.
 - `forget(id) -> Result<Forgetting, Refusal>`: drops a confirmed or dead
