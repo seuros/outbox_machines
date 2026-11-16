@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/seuros/outbox_machines/compare/outbox_machines/v0.8.0...outbox_machines/v0.8.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* fix wrapped classes at load so building a value runs no Ruby ([0aecf34](https://github.com/seuros/outbox_machines/commit/0aecf34e6c76d99fffdceeeb1b1d6bebdb498b68))
+
 ## [0.8.0](https://github.com/seuros/outbox_machines/compare/outbox_machines/v0.7.0...outbox_machines/v0.8.0) (2026-11-16)
 
 
