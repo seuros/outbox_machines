@@ -307,6 +307,7 @@ fn run(seed: u64, scope: u16, tally: &mut Seen) {
                 )
             });
             assert_eq!(rebuilt, entry, "seed {seed}");
+            super::restore::restores(&outbox, row.id, seed);
             let entry = entry.map(|e| (e.state(), e.attempts(), e.attempt()));
             let attempt = (row.attempt != 0).then_some(row.attempt);
             assert_eq!(

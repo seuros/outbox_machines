@@ -280,6 +280,7 @@ mod clock;
 mod model;
 mod reissue;
 mod repeat;
+mod restore;
 mod scope;
 mod values;
 

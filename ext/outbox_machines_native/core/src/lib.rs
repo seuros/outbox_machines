@@ -3,6 +3,7 @@
 #![doc = include_str!("../README.md")]
 
 mod refusal;
+mod restore;
 mod values;
 
 use core::num::NonZeroU32;
@@ -11,7 +12,7 @@ use core::time::Duration;
 use periscope_machines::Issuer;
 
 pub use refusal::Refusal;
-pub use values::{Claimed, Disposition, Entry, Expired, Pass, Sweep};
+pub use values::{Claimed, Disposition, Entry, Expired, Pass, Stored, Sweep};
 
 /// Delivery state of one record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,7 +166,8 @@ impl<const N: usize> Outbox<N> {
     /// The next claim carries sequence `issued + 1`, so an attempt that
     /// outlived the restart is never issued again and cannot settle a new
     /// claim. `resumed(max_attempts, scope, 0)` is [`Outbox::with_scope`].
-    /// Records are not restored: enqueue them again.
+    /// It holds no record: [`Outbox::restored`] brings one back with the
+    /// sequence.
     ///
     /// Resuming from a count lower than what was really issued reissues
     /// identities, so save [`Outbox::issued`] before acting on a claim. An
@@ -195,6 +197,13 @@ impl<const N: usize> Outbox<N> {
     #[must_use]
     pub const fn issued(&self) -> u64 {
         self.attempts.issued()
+    }
+
+    /// The latest honoured instant; a call at an earlier one is refused.
+    /// Save it with [`Outbox::stored`] to rebuild through [`Outbox::restored`].
+    #[must_use]
+    pub const fn observed(&self) -> Duration {
+        self.observed
     }
 
     /// Compile-time record capacity.

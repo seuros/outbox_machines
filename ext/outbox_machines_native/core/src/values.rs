@@ -296,3 +296,158 @@ impl Entry {
         self.available_at
     }
 }
+
+/// One record as an adapter stores it: everything
+/// [`Outbox::restored`](crate::Outbox::restored) needs to rebuild it, read
+/// back from [`Outbox::stored`](crate::Outbox::stored).
+///
+/// `latest` is the [`Claimed`] of the record's latest attempt, its identity
+/// and lease end; `failed` is the `retry_after` of the `fail` that ended it,
+/// `None` when the attempt is live, confirmed, or was reaped by
+/// [`Outbox::expire_claims`](crate::Outbox::expire_claims).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stored {
+    id: u64,
+    state: State,
+    attempts: u32,
+    latest: Option<Claimed>,
+    available_at: Duration,
+    failed: Option<Duration>,
+}
+
+impl Stored {
+    /// A stored record, or `None` for one no outbox holds:
+    ///
+    /// - `latest` is present exactly when `attempts` is not zero, names this
+    ///   `id`, and its sequence is at least `attempts` (every claim takes the
+    ///   next identity).
+    /// - A pending record never claimed has no `failed`. One that was claimed
+    ///   is back from a `fail` (`available_at` at least `failed`, the fail's
+    ///   instant plus its delay) or from a reap (`failed` is `None` and
+    ///   `available_at`, the sweep's instant, is not before the lease end).
+    /// - A claimed or confirmed record has no `failed`.
+    /// - A claimed, confirmed or dead record was claimed at or after
+    ///   `available_at` and before its lease end, so `available_at` is
+    ///   earlier than the lease end. A dead record's `failed` delay added to
+    ///   `available_at` does not overflow.
+    #[must_use]
+    pub const fn new(
+        id: u64,
+        state: State,
+        attempts: u32,
+        latest: Option<Claimed>,
+        available_at: Duration,
+        failed: Option<Duration>,
+    ) -> Option<Self> {
+        let reachable = match latest {
+            None => attempts == 0 && failed.is_none() && matches!(state, State::Pending),
+            Some(claimed) => {
+                claimed.id == id
+                    && attempts != 0
+                    && sequence_of(claimed.attempt) >= attempts as u64
+                    && Self::settled(state, available_at, claimed.lease_expires, failed)
+            }
+        };
+        if reachable {
+            Some(Self::kept(
+                id,
+                state,
+                attempts,
+                latest,
+                available_at,
+                failed,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Whether a claimed record in `state` can stand at `available_at` with
+    /// its lease ending at `expires` and `failed` as recorded.
+    const fn settled(
+        state: State,
+        available_at: Duration,
+        expires: Duration,
+        failed: Option<Duration>,
+    ) -> bool {
+        let leased = available_at.as_nanos() < expires.as_nanos();
+        match (state, failed) {
+            (State::Pending, Some(delay)) => available_at.checked_sub(delay).is_some(),
+            (State::Pending, None) => !leased,
+            (State::Claimed | State::Confirmed, Some(_)) => false,
+            (State::Dead, Some(delay)) => leased && available_at.checked_add(delay).is_some(),
+            (State::Claimed | State::Confirmed | State::Dead, None) => leased,
+        }
+    }
+
+    /// A record the outbox holds; it upholds what [`Stored::new`] checks.
+    pub(crate) const fn kept(
+        id: u64,
+        state: State,
+        attempts: u32,
+        latest: Option<Claimed>,
+        available_at: Duration,
+        failed: Option<Duration>,
+    ) -> Self {
+        Self {
+            id,
+            state,
+            attempts,
+            latest,
+            available_at,
+            failed,
+        }
+    }
+
+    /// The earliest instant an outbox holding this record has observed: the
+    /// last call that set `available_at` ran then, or `failed` earlier for a
+    /// record back from a `fail`.
+    pub(crate) const fn floor(&self) -> Duration {
+        match (self.state, self.failed) {
+            (State::Pending, Some(delay)) => match self.available_at.checked_sub(delay) {
+                Some(failed_at) => failed_at,
+                None => Duration::ZERO,
+            },
+            (State::Pending | State::Claimed | State::Confirmed | State::Dead, _) => {
+                self.available_at
+            }
+        }
+    }
+
+    /// Record id.
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Current state.
+    #[must_use]
+    pub const fn state(&self) -> State {
+        self.state
+    }
+
+    /// Claims issued to this record so far.
+    #[must_use]
+    pub const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    /// The latest attempt's identity and lease end; `None` until the record
+    /// is first claimed.
+    #[must_use]
+    pub const fn latest(&self) -> Option<Claimed> {
+        self.latest
+    }
+
+    /// Earliest instant a pending record may be claimed.
+    #[must_use]
+    pub const fn available_at(&self) -> Duration {
+        self.available_at
+    }
+
+    /// The `retry_after` of the `fail` that ended the latest attempt.
+    #[must_use]
+    pub const fn failed(&self) -> Option<Duration> {
+        self.failed
+    }
+}

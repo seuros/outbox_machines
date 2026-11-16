@@ -65,6 +65,8 @@ small. Ids are `u64`; payloads live outside.
 - `get(id) -> Option<Entry>`: the record's state, `attempts` (the claims it
   has had, which is what `max_attempts` counts) and `attempt` (the identity
   of the latest one, `None` before the first claim).
+- `stored(id) -> Option<Stored>`: the record as an adapter persists it, for
+  `Outbox::restored`.
 
 ## Attempt identities
 
@@ -102,6 +104,18 @@ with `Outbox::resumed(max_attempts, scope, issued)`, which continues at
 `issued + 1` (`None` when `issued` is past 2^48 - 1), or give each incarnation
 a scope no earlier one used. Save the count before acting on a claim:
 resuming from too low a count reissues identities.
+
+An adapter that keeps one record per row rebuilds the outbox for each
+request instead: persist `Outbox::stored(id)` (state, attempts, the latest
+`Claimed`, `available_at`, and the `retry_after` of the `fail` that ended it),
+`issued()` and `observed()` with every honoured change, and restore with
+`Outbox::restored(max_attempts, scope, issued, observed, stored)`. It holds
+that one record, first in line, and answers every later report as the outbox
+it came from would. `Stored::new` refuses a record no outbox holds, and
+`restored` a state no outbox of that scope and `max_attempts` reaches (an
+attempt it never issued, claims past `max_attempts`, `observed` before the
+call that last moved the record). Neither can tell a stale row from the
+newest one: restoring an older row revives settled attempts.
 
 A scope holds 2^48 - 1 identities. When they are spent `claim` refuses with
 `Exhausted` rather than wrap, and only when a record is due.
