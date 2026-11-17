@@ -1,5 +1,5 @@
 {
-  ".": "0.8.1",
-  "ext/outbox_machines_native/core": "0.9.0",
-  "ext/outbox_machines_native/ffi": "0.1.8"
+  ".": "0.8.2",
+  "ext/outbox_machines_native/core": "0.10.0",
+  "ext/outbox_machines_native/ffi": "0.1.9"
 }

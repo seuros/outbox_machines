@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/seuros/outbox_machines/compare/outbox-machines-v0.9.0...outbox-machines-v0.10.0) (2026-11-16)
+
+
+### Features
+
+* restore an outbox from a stored record ([92fa5c5](https://github.com/seuros/outbox_machines/commit/92fa5c5e22a6bed2b5c79348641a6d933b9c6a90))
+
 ## [0.9.0](https://github.com/seuros/outbox_machines/compare/outbox-machines-v0.8.0...outbox-machines-v0.9.0) (2026-11-16)
 
 
